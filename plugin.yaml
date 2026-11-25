@@ -1,15 +1,18 @@
 name: reticulum-platform
 label: Reticulum (LXMF)
 kind: platform
-version: 2.0.0
+version: 2.1.0
 manifest_version: 2
 description: >
   Reticulum / LXMF gateway adapter for Hermes Agent. Runs an LXMF delivery
   endpoint on a Reticulum mesh so Sideband, Nomad Network and other LXMF
   clients can message the agent over LoRa, TCP, I2P or any other Reticulum
-  transport — no central messaging server. Text-only, allow-listed by LXMF
-  destination hash, with optional store-and-forward fallback through an
-  LXMF propagation node.
+  transport — no central messaging server. Text and voice: inbound voice
+  notes (Ogg/Opus or Codec2) are transcribed by the gateway's STT pipeline,
+  and replies can be spoken back as Ogg/Opus voice notes (TTS). Every message
+  carries a UTC timestamp; out-of-order arrivals are reordered and flagged.
+  Allow-listed by LXMF destination hash, with optional store-and-forward
+  fallback through an LXMF propagation node.
 author: Kyle Williquette
 license: MIT
 homepage: https://github.com/Vaultpls/hermes-reticulum-platform
@@ -86,4 +89,24 @@ optional_env:
   - name: HERMES_RETICULUM_TEXT_BATCH_DELAY
     description: "Quiet-period seconds (default: 1.5) used to merge rapid inbound messages into one turn"
     prompt: "Text batch flush delay in seconds (default: 1.5)"
+    password: false
+  - name: RETICULUM_TIMESTAMPS
+    description: "Prefix every message with a UTC send timestamp and read the sender's timestamp (default: true)"
+    prompt: "Message timestamps? (true/false)"
+    password: false
+  - name: RETICULUM_REORDER_WINDOW
+    description: "Seconds inbound messages are held so late arrivals can be sorted by timestamp (default: 1.0; 0 disables reordering)"
+    prompt: "Out-of-order reorder window in seconds (default: 1.0)"
+    password: false
+  - name: RETICULUM_AUDIO_BITRATE
+    description: "Opus bitrate for outbound voice notes (default: 24k)"
+    prompt: "Voice-note Opus bitrate (default: 24k)"
+    password: false
+  - name: RETICULUM_TTS_MAX_BYTES
+    description: "Largest outbound voice note in bytes before it is skipped (default: 98304)"
+    prompt: "Max outbound voice note bytes (default: 98304)"
+    password: false
+  - name: RETICULUM_MAX_AUDIO_BYTES
+    description: "Largest inbound voice clip accepted in bytes (default: 4194304)"
+    prompt: "Max inbound voice clip bytes (default: 4194304)"
     password: false

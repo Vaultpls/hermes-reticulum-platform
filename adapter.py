@@ -50,8 +50,11 @@ import math
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import threading
 import time
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -80,6 +83,33 @@ DEFAULT_MAX_MESSAGE_LENGTH = 1000
 DEFAULT_TEXT_BATCH_DELAY = 1.5
 MIN_ANNOUNCE_INTERVAL = 300.0  # RNS rate-limits announces; below this is pointless
 MAX_MESSAGE_LENGTH = 8000
+
+# Voice (telephone-style use from Sideband and other LXMF phone clients).
+# LXMF carries voice notes in FIELD_AUDIO as [mode, bytes]; Sideband plays
+# AM_OPUS_OGG directly and decodes the Codec2 modes, so replies are always
+# Ogg/Opus and inbound Codec2 is transcoded to Ogg/Opus before STT sees it.
+DEFAULT_AUDIO_BITRATE = "24k"
+DEFAULT_MAX_AUDIO_BYTES = 4 * 1024 * 1024      # inbound clip cap (before transcode)
+DEFAULT_TTS_MAX_BYTES = 96 * 1024             # outbound voice-note cap (mesh budget)
+DEFAULT_REORDER_WINDOW = 1.0                  # seconds to hold for late arrivals
+DEFAULT_TIMESTAMPS = True
+MAX_REORDER_WINDOW = 30.0
+AUDIO_MODE_OPUS_OGG = 0x10
+_CODEC2_FFMPEG_MODES = {
+    0x03: "700C", 0x04: "1200", 0x05: "1300", 0x06: "1400",
+    0x07: "1600", 0x08: "2400", 0x09: "3200",
+}
+_AUDIO_EXTS = frozenset({
+    ".ogg", ".oga", ".opus", ".mp3", ".m4a", ".m2a", ".wav", ".flac",
+    ".aac", ".caf", ".amr", ".3gp", ".webm",
+})
+_AUDIO_MIME_BY_EXT = {
+    ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/opus",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".m2a": "audio/mpeg",
+    ".wav": "audio/wav", ".flac": "audio/flac", ".aac": "audio/aac",
+    ".caf": "audio/x-caf", ".amr": "audio/amr", ".3gp": "audio/3gpp",
+    ".webm": "audio/webm",
+}
 
 _LXMF_DELIVERY_ASPECT = ("lxmf", "delivery")
 
@@ -163,6 +193,167 @@ def _source_hash_of(message) -> Optional[str]:
     return _normalize_hash(raw)
 
 
+def _utc_stamp(timestamp: float) -> str:
+    """Human-readable UTC timestamp used in every message body (``2026-11-25 14:03:12Z``)."""
+    return datetime.fromtimestamp(timestamp, tz=UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _outbound_stamp(timestamp: float, index: int = 0, total: int = 1) -> str:
+    """Prefix for an outgoing part: ``[<utc>]`` or ``[<utc> 2/5]``.
+
+    Every part carries the stamp so a client that reassembles a split reply out
+    of order can still sort it, and so a human can see when it was sent.
+    """
+    head = _utc_stamp(timestamp)
+    if total > 1:
+        head = f"{head} {index}/{total}"
+    return f"[{head}] "
+
+
+def _inbound_stamp(timestamp: float, received_at: float, out_of_order: bool) -> str:
+    """Prefix for an incoming message: its send time, flagged when it arrived late."""
+    head = _utc_stamp(timestamp)
+    if out_of_order:
+        head = f"{head} | out of order, arrived {max(0.0, received_at - timestamp):.0f}s late"
+    return f"[{head}] "
+
+
+def _is_message_hash(value: Any) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "").strip().lower()))
+
+
+def _audio_mime_for(name: str) -> Optional[str]:
+    return _AUDIO_MIME_BY_EXT.get(Path(str(name or "")).suffix.lower())
+
+
+def _decode_codec2_to_ogg(data: bytes, mode: int, bitrate: str = DEFAULT_AUDIO_BITRATE,
+                          timeout: int = 120) -> Optional[str]:
+    """Transcode a raw Codec2 voice frame stream to Ogg/Opus.
+
+    Sideband's PTT default is Codec2 (2400 bps) to survive LoRa links, so most
+    phone voice notes arrive that way. ffmpeg ships a ``codec2raw`` demuxer with
+    libcodec2; when it is unavailable the clip is reported instead of being
+    silently dropped.
+    """
+    ff_mode = _CODEC2_FFMPEG_MODES.get(int(mode))
+    ffmpeg = shutil.which("ffmpeg")
+    if not ff_mode or not ffmpeg or not data:
+        return None
+    fd, src_path = tempfile.mkstemp(prefix="lxmf_codec2_", suffix=".c2")
+    os.close(fd)
+    fd, out_path = tempfile.mkstemp(prefix="lxmf_codec2_", suffix=".ogg")
+    os.close(fd)
+    decoded = False
+    try:
+        with open(src_path, "wb") as handle:
+            handle.write(data)
+        result = subprocess.run(
+            [ffmpeg, "-v", "error", "-y", "-f", "codec2raw", "-mode", ff_mode,
+             "-i", src_path, "-acodec", "libopus", "-ac", "1", "-b:a", bitrate,
+             "-application", "voip", "-f", "ogg", out_path],
+            capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, check=False)
+        if result.returncode == 0 and os.path.getsize(out_path) > 0:
+            decoded = True
+            return out_path
+        logger.warning("Reticulum: Codec2 (%s) decode failed: %s", ff_mode,
+                       (result.stderr or b"").decode("utf-8", errors="replace")[:300])
+        return None
+    except Exception as exc:
+        logger.warning("Reticulum: Codec2 (%s) decode error: %s", ff_mode, exc)
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(src_path)
+        if not decoded:
+            with contextlib.suppress(OSError):
+                os.unlink(out_path)
+
+
+def _transcode_audio_file(path: str, bitrate: str = DEFAULT_AUDIO_BITRATE) -> Optional[str]:
+    """Transcode any ffmpeg-readable audio file to Ogg/Opus, returning a temp path."""
+    from gateway.platforms.base import transcode_to_ogg_opus
+    return transcode_to_ogg_opus(path, bitrate=bitrate)
+
+
+def _extract_audio_fields(message, max_bytes: int) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Save LXMF voice/audio attachments to the audio cache.
+
+    Returns ``(paths, mime_types, file_names, notes)``; ``notes`` are
+    human-readable lines for clips this host cannot decode so the agent (and
+    the sender) learns why a voice note produced no transcript.
+    """
+    import LXMF
+    from gateway.platforms.base import cache_audio_from_bytes
+
+    paths: list[str] = []
+    mimes: list[str] = []
+    names: list[str] = []
+    notes: list[str] = []
+    fields = getattr(message, "fields", None) or {}
+    if not isinstance(fields, dict):
+        return paths, mimes, names, notes
+
+    def _too_big(blob: "bytes | bytearray") -> bool:
+        return len(blob) > max_bytes
+
+    audio_field = fields.get(getattr(LXMF, "FIELD_AUDIO", 0x07))
+    if isinstance(audio_field, (list, tuple)) and len(audio_field) >= 2:
+        mode, blob = audio_field[0], audio_field[1]
+        try:
+            mode = int(mode)
+        except (TypeError, ValueError):
+            mode = -1
+        if not isinstance(blob, (bytes, bytearray)) or not blob:
+            pass
+        elif _too_big(blob):
+            notes.append(f"[voice note dropped: {len(blob)} bytes exceeds the {max_bytes} byte limit]")
+        elif mode == AUDIO_MODE_OPUS_OGG:
+            path = cache_audio_from_bytes(bytes(blob), ".ogg")
+            paths.append(path)
+            mimes.append("audio/ogg")
+            names.append("voice-note.ogg")
+        elif mode in _CODEC2_FFMPEG_MODES:
+            ogg_path = _decode_codec2_to_ogg(bytes(blob), mode)
+            if ogg_path:
+                try:
+                    with open(ogg_path, "rb") as handle:
+                        path = cache_audio_from_bytes(handle.read(), ".ogg")
+                    paths.append(path)
+                    mimes.append("audio/ogg")
+                    names.append("voice-note.ogg")
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.unlink(ogg_path)
+            else:
+                notes.append(
+                    "[voice note in Codec2 mode could not be decoded on this host; "
+                    "ask the sender to enable HQ voice (Opus) or type the message]")
+        else:
+            notes.append(f"[voice note in unsupported audio mode 0x{mode & 0xFF:02x}; ask the sender to resend as Opus]")
+
+    attachments = fields.get(getattr(LXMF, "FIELD_FILE_ATTACHMENTS", 0x05))
+    if isinstance(attachments, (list, tuple)):
+        for item in attachments[:8]:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            name, blob = item[0], item[1]
+            if isinstance(name, (bytes, bytearray)):
+                name = bytes(name).decode("utf-8", errors="replace")
+            name = str(name or "")
+            mime = _audio_mime_for(name)
+            if not mime or not isinstance(blob, (bytes, bytearray)) or not blob:
+                continue
+            if _too_big(blob):
+                notes.append(f"[audio attachment {name} dropped: exceeds the {max_bytes} byte limit]")
+                continue
+            suffix = Path(name).suffix.lower() or ".ogg"
+            path = cache_audio_from_bytes(bytes(blob), suffix)
+            paths.append(path)
+            mimes.append(mime)
+            names.append(name or f"attachment{suffix}")
+    return paths, mimes, names, notes
+
+
 def _parse_hash_list(raw: Any) -> set[str]:
     """Parse ``RETICULUM_ALLOWED_USERS`` / ``extra.allowed_users`` into a hash set."""
     if isinstance(raw, str):
@@ -197,6 +388,11 @@ def _invalid_hash_items(raw: Any) -> list[str]:
     return bad
 
 
+def _strip_part_tag(part: str) -> str:
+    """Drop the ``[2/5] `` tag ``_split_message`` adds (the stamp carries its own index)."""
+    return re.sub(r"^\[\d+/\d+\]\s*", "", part or "")
+
+
 def _split_message(text: str, limit: int) -> list[str]:
     """Split long replies at word boundaries, tagging multi-part chunks."""
     if not text:
@@ -229,7 +425,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def _strip_media_tags(content: str) -> tuple[str, int]:
-    """Remove ``MEDIA:<path>`` directives; this bridge is text-only."""
+    """Remove ``MEDIA:<path>`` directives; audio rides in LXMF's audio field instead."""
     paths = _MEDIA_TAG.findall(content or "")
     return _MEDIA_TAG.sub("", content or "").strip(), len(paths)
 
@@ -548,6 +744,33 @@ class ReticulumAdapter(BasePlatformAdapter):
         self._text_batch_delay_seconds = max(0.0, batch_delay)
         self._text_batch_split_delay_seconds = self._text_batch_delay_seconds
 
+        # Timestamps ride in every outbound body and inbound bodies are stamped
+        # with the sender's own LXMF timestamp, so a phone client that receives
+        # parts out of order can still reconstruct the sequence.
+        self.timestamps = _truthy(
+            _env_or_extra("RETICULUM_TIMESTAMPS", extra, "timestamps", DEFAULT_TIMESTAMPS),
+            DEFAULT_TIMESTAMPS)
+        # Late-arrival buffer: hold inbound messages briefly, sort them by their
+        # LXMF timestamps, then dispatch. 0 disables reordering (stamps still
+        # make the true order readable, the message is just flagged as late).
+        self.reorder_window = min(MAX_REORDER_WINDOW, max(0.0, _as_float(
+            _env_or_extra("RETICULUM_REORDER_WINDOW", extra, "reorder_window",
+                          DEFAULT_REORDER_WINDOW), DEFAULT_REORDER_WINDOW)))
+        self.reorder_max_batch = _as_int(
+            extra.get("reorder_max_batch", 16), 16, minimum=1, maximum=128)
+
+        # Voice notes (telephone-style: talk to the agent, hear a reply).
+        self.audio_bitrate = str(_env_or_extra(
+            "RETICULUM_AUDIO_BITRATE", extra, "audio_bitrate", DEFAULT_AUDIO_BITRATE))
+        self.max_audio_bytes = _as_int(
+            _env_or_extra("RETICULUM_MAX_AUDIO_BYTES", extra, "max_audio_bytes",
+                          DEFAULT_MAX_AUDIO_BYTES),
+            DEFAULT_MAX_AUDIO_BYTES, minimum=64 * 1024, maximum=64 * 1024 * 1024)
+        self.tts_max_bytes = _as_int(
+            _env_or_extra("RETICULUM_TTS_MAX_BYTES", extra, "tts_max_bytes",
+                          DEFAULT_TTS_MAX_BYTES),
+            DEFAULT_TTS_MAX_BYTES, minimum=8 * 1024, maximum=16 * 1024 * 1024)
+
         self._stack: Optional[_BridgeStack] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._announce_task: Optional[asyncio.Task] = None
@@ -555,6 +778,16 @@ class ReticulumAdapter(BasePlatformAdapter):
         self._running = False
         self._address_hex: Optional[str] = None
         self._denial_times: dict[str, float] = {}
+        # Inbound sequencing: per-source pending records, a quiet-period task,
+        # the last send timestamp already handed to the agent, and a dedupe
+        # ledger (LXMF can deliver the same envelope twice through DIRECT and
+        # store-and-forward).
+        self._order_seq = 0
+        self._order_pending: dict[str, list[dict[str, Any]]] = {}
+        self._order_tasks: dict[str, asyncio.Task] = {}
+        self._last_sent_at: dict[str, float] = {}
+        self._seen_messages: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+        self._seen_messages_ttl = 900.0
         # Bound once so sink identity comparison in disconnect() is reliable.
         self._sink_callback = self._on_lxmf_message
 
@@ -576,12 +809,13 @@ class ReticulumAdapter(BasePlatformAdapter):
 
         logger.info(
             "Reticulum adapter initialized: name=%s storage=%s stamp=%s allow_all=%s "
-            "allowed=%d propagation_node=%s fallback=%s",
+            "allowed=%d propagation_node=%s fallback=%s timestamps=%s reorder=%.1fs voice=%s",
             self.display_name, self.storage_path,
             self.stamp_cost if self.stamp_cost else "off",
             self._allow_all(), len(self._allowed_users()),
             self.propagation_node or ("auto" if self.auto_propagation_node else "none"),
-            self.propagated_fallback)
+            self.propagated_fallback, self.timestamps, self.reorder_window,
+            f"opus@{self.audio_bitrate}")
 
     # -- address / display ---------------------------------------------------
 
@@ -773,6 +1007,13 @@ class ReticulumAdapter(BasePlatformAdapter):
             _LIVE_ADAPTER = None
         self._stop_announce_loop()
         self._stop_propagation_sync_loop()
+        # Drop any partially held reorder batches: a reconnect must not replay
+        # messages captured before the disconnect under a stale timer.
+        for task in list(self._order_tasks.values()):
+            if task is not None and not task.done():
+                task.cancel()
+        self._order_tasks.clear()
+        self._order_pending.clear()
         if self._stack is not None and self._stack.sink is self._sink_callback:
             self._stack.sink = None
         self._mark_disconnected()
@@ -857,17 +1098,6 @@ class ReticulumAdapter(BasePlatformAdapter):
             logger.debug("Reticulum: dropping LXMF message with no source hash")
             return
 
-        text = (message.content_as_string() or "").strip()
-        try:
-            title = (message.title_as_string() or "").strip()
-        except Exception:
-            title = ""
-        if title:
-            text = f"{title}\n{text}" if text else title
-        if not text:
-            logger.debug("Reticulum: dropping empty message from %s", _short(source))
-            return
-
         if not self._is_allowed(source):
             logger.info("Reticulum: ignoring message from unauthorized %s", _short(source))
             if self.deny_reply and self._loop is not None and not self._loop.is_closed():
@@ -875,25 +1105,91 @@ class ReticulumAdapter(BasePlatformAdapter):
                     self._schedule_denial, source)
             return
 
+        raw_hash = getattr(message, "hash", None)
+        message_id = bytes(raw_hash).hex() if isinstance(raw_hash, (bytes, bytearray)) else None
+        if message_id and self._is_duplicate(source, message_id):
+            logger.info("Reticulum: dropping duplicate delivery of %s from %s",
+                        message_id[:12], _short(source))
+            return
+
+        text_parts: list[str] = []
+        try:
+            title = (message.title_as_string() or "").strip()
+        except Exception:
+            title = ""
+        try:
+            content = (message.content_as_string() or "").strip()
+        except Exception:
+            content = ""
+        if title:
+            text_parts.append(title)
+        if content:
+            text_parts.append(content)
+
+        # Voice notes: FIELD_AUDIO (Sideband PTT) and audio file attachments.
+        # Saved into the audio cache so the gateway's own STT pipeline
+        # transcribes them exactly like a Telegram/WhatsApp voice message.
+        audio_paths: list[str] = []
+        audio_mimes: list[str] = []
+        audio_names: list[str] = []
+        try:
+            audio_paths, audio_mimes, audio_names, audio_notes = _extract_audio_fields(
+                message, self.max_audio_bytes)
+        except Exception:
+            logger.exception("Reticulum: could not extract audio from message")
+            audio_notes = []
+        if audio_notes:
+            text_parts.extend(audio_notes)
+        if audio_paths:
+            logger.info("Reticulum: voice note from %s (%d clip(s), %d bytes total)",
+                        _short(source), len(audio_paths),
+                        sum(os.path.getsize(path) for path in audio_paths if os.path.exists(path)))
+
+        text = "\n".join(part for part in text_parts if part).strip()
+        if not text and not audio_paths:
+            logger.debug("Reticulum: dropping empty message from %s", _short(source))
+            return
+
         try:
             timestamp = float(getattr(message, "timestamp", None) or time.time())
         except (TypeError, ValueError):
             timestamp = time.time()
-        if not math.isfinite(timestamp) or abs(time.time() - timestamp) > 30 * 86400:
-            timestamp = time.time()
+        received_at = time.time()
+        # Keep the sender's own timestamp even when it is old: a message that
+        # spent a week in store-and-forward is still that old, and rewriting it
+        # to "now" destroys the ordering the stamp exists to preserve. Only
+        # non-finite values and clocks running far ahead are corrected, and the
+        # latter cannot be trusted as a "late arrival" baseline.
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            timestamp = received_at
+        elif timestamp > received_at + 7 * 86400:
+            logger.info("Reticulum: correcting a future-dated timestamp from %s", _short(source))
+            timestamp = received_at
+
         meta = {
             "lxmf_source": source,
             "signature_validated": True,
             "method": getattr(message, "method", None),
             "rssi": getattr(message, "rssi", None),
             "snr": getattr(message, "snr", None),
+            "sent_at": timestamp,
+            "received_at": received_at,
+            "media_urls": audio_paths,
+            "media_types": audio_mimes,
+            "media_filenames": audio_names,
         }
-        raw_hash = getattr(message, "hash", None)
-        if isinstance(raw_hash, (bytes, bytearray)):
-            meta["lxmf_message_id"] = bytes(raw_hash).hex()
+        if message_id:
+            meta["lxmf_message_id"] = message_id
+        record = {
+            "source": source,
+            "text": text,
+            "timestamp": timestamp,
+            "received_at": received_at,
+            "meta": meta,
+            "message_id": message_id,
+        }
         if self._loop is not None and not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(
-                self._schedule_inbound, text, source, timestamp, meta)
+            self._loop.call_soon_threadsafe(self._submit_inbound, record)
 
     def _quarantine_unverified(self, message, source: Optional[str], reason) -> None:
         """Hold an unverified message and retry once its source identity is known.
@@ -963,15 +1259,109 @@ class ReticulumAdapter(BasePlatformAdapter):
         logger.info("Reticulum: recovered quarantined message from %s", _short(source))
         self._process_inbound(message, source)
 
-    def _schedule_inbound(self, text: str, source: str, timestamp: float, meta: dict) -> None:
-        if self._loop is not None and not self._loop.is_closed():
-            self._loop.create_task(self._guarded_dispatch(text, source, timestamp, meta))
+    # -- inbound sequencing --------------------------------------------------
 
-    async def _guarded_dispatch(self, text: str, source: str, timestamp: float, meta: dict) -> None:
+    def _is_duplicate(self, source: str, message_id: str) -> bool:
+        """True when this exact LXMF envelope was already accepted.
+
+        LXMF may hand the same message to the delivery callback twice (a DIRECT
+        link proof plus a store-and-forward copy), which would otherwise run
+        the same user turn twice.
+        """
+        now = time.time()
+        key = (source, message_id.lower())
+        seen = self._seen_messages
+        if key in seen and now - seen[key] <= self._seen_messages_ttl:
+            return True
+        seen[key] = now
+        seen.move_to_end(key)
+        while seen and (len(seen) > 2048
+                        or now - next(iter(seen.values())) > self._seen_messages_ttl):
+            seen.popitem(last=False)
+        return False
+
+    def _submit_inbound(self, record: dict) -> None:
+        """Queue an inbound record on the event loop and reorder within the window.
+
+        Mesh links deliver out of order: a retry over a slower path can land
+        after a newer message. Hold each source's arrivals for a short quiet
+        period, sort by the sender's own LXMF timestamp, then dispatch in that
+        order. Anything that still arrives late (past the window) is dispatched
+        immediately and flagged, because a turn cannot be rewound.
+        """
+        if self._loop is None or self._loop.is_closed():
+            return
+        self._order_seq += 1
+        record["seq"] = self._order_seq
+        if self.reorder_window <= 0:
+            self._flush_records([record], source=record["source"])
+            return
+        source = record["source"]
+        pending = self._order_pending.setdefault(source, [])
+        pending.append(record)
+        if len(pending) >= self.reorder_max_batch:
+            self._flush_pending(source)
+            return
+        prior = self._order_tasks.get(source)
+        if prior is not None and not prior.done():
+            prior.cancel()
+        self._order_tasks[source] = self._loop.create_task(self._flush_after_window(source))
+
+    async def _flush_after_window(self, source: str) -> None:
         try:
-            await self._dispatch_message(text, source, timestamp, meta)
-        except Exception:
-            logger.exception("Reticulum: failed to dispatch inbound message from %s", _short(source))
+            await asyncio.sleep(self.reorder_window)
+        except asyncio.CancelledError:
+            return
+        self._flush_pending(source)
+
+    def _flush_pending(self, source: str) -> None:
+        records = self._order_pending.pop(source, [])
+        task = self._order_tasks.pop(source, None)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        if records:
+            self._flush_records(records, source=source)
+
+    def _flush_records(self, records: list[dict[str, Any]], *, source: str) -> None:
+        records = sorted(records, key=lambda item: (item["timestamp"], item["seq"]))
+        arrival_order = [item["seq"] for item in sorted(records, key=lambda item: item["seq"])]
+        sent_order = [item["seq"] for item in records]
+        if arrival_order != sent_order:
+            logger.info("Reticulum: reordered %d message(s) from %s by their timestamps",
+                        len(records), _short(source))
+        last = self._last_sent_at.get(source)
+        for item in records:
+            # Only messages that arrive after the window closed can be late;
+            # within the window the sort already restored the true order. A
+            # sender whose clock runs ahead must not poison every later message.
+            item["out_of_order"] = bool(
+                last is not None
+                and item["timestamp"] < last - 0.5
+                and item["timestamp"] < item["received_at"] - 0.5)
+            if item["out_of_order"]:
+                logger.info(
+                    "Reticulum: out-of-order message from %s (sent %s, %.0fs before the last one handled)",
+                    _short(source), _utc_stamp(item["timestamp"]),
+                    max(0.0, last - item["timestamp"]))
+        newest = max(item["timestamp"] for item in records)
+        baseline = min(newest, max(item["received_at"] for item in records) + 2.0)
+        self._last_sent_at[source] = max(last or 0.0, baseline)
+        if self._loop is None or self._loop.is_closed():
+            return
+        self._loop.create_task(self._dispatch_in_order(records))
+
+    async def _dispatch_in_order(self, records: list[dict[str, Any]]) -> None:
+        for item in records:
+            if not self._running:
+                return
+            try:
+                await self._dispatch_message(
+                    item["text"], item["source"], item["timestamp"], item["meta"],
+                    received_at=item["received_at"],
+                    out_of_order=item.get("out_of_order", False))
+            except Exception:
+                logger.exception("Reticulum: failed to dispatch inbound message from %s",
+                                 _short(item["source"]))
 
     def _schedule_denial(self, source: str) -> None:
         now = time.time()
@@ -986,7 +1376,9 @@ class ReticulumAdapter(BasePlatformAdapter):
             self._loop.create_task(self._send_denial(source))
 
     async def _dispatch_message(self, text: str, source_hash: str,
-                                timestamp: float, meta: dict) -> None:
+                                timestamp: float, meta: dict,
+                                *, received_at: Optional[float] = None,
+                                out_of_order: bool = False) -> None:
         peer_name = self._stack.peer_names.get(source_hash) if self._stack else None
         short = f"lxmf:{_short(source_hash)}"
         session_source = self.build_source(
@@ -997,17 +1389,44 @@ class ReticulumAdapter(BasePlatformAdapter):
             user_name=peer_name or source_hash,
         )
         message_id = meta.get("lxmf_message_id") or f"{source_hash}:{int(timestamp)}"
+        media_urls = list(meta.get("media_urls") or [])
+        media_types = list(meta.get("media_types") or [])
+        media_names = list(meta.get("media_filenames") or [])
+        received_at = received_at or time.time()
+
+        # The sender's own LXMF timestamp leads every message body. The agent
+        # reads it directly, so a late arrival still slots into the right place
+        # in the conversation and can be acknowledged as late.
+        body = text
+        if self.timestamps:
+            stamp = _inbound_stamp(timestamp, received_at, out_of_order)
+            body = f"{stamp}{text}" if text else stamp.strip()
+        elif out_of_order:
+            body = f"[out of order] {text}" if text else "[out of order: voice message]"
+
+        is_voice = bool(media_urls) and any(mime.startswith("audio/") for mime in media_types)
         event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
+            text=body,
+            message_type=MessageType.VOICE if is_voice else MessageType.TEXT,
             user_id=source_hash,
             user_name=peer_name or source_hash,
             source=session_source,
             message_id=message_id,
             timestamp=datetime.fromtimestamp(timestamp, tz=UTC),
+            media_urls=media_urls,
+            media_types=media_types,
+            media_filenames=media_names,
             raw_message=meta,
+            metadata={
+                "reticulum_sent_at": timestamp,
+                "reticulum_received_at": received_at,
+                "reticulum_out_of_order": out_of_order,
+                "reticulum_voice": is_voice,
+            },
         )
-        logger.debug("Reticulum: message from %s: %.80s", _short(source_hash), text)
+        logger.debug("Reticulum: message from %s sent %s%s: %.80s",
+                     _short(source_hash), _utc_stamp(timestamp),
+                     " (late)" if out_of_order else "", text)
         self._enqueue_text_event(event)
 
     def _text_batch_key(self, event: MessageEvent) -> str:
@@ -1064,21 +1483,36 @@ class ReticulumAdapter(BasePlatformAdapter):
         text, media_count = _strip_media_tags(content)
         text = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
         if media_count and not text:
-            text = "[attachment not delivered: this LXMF bridge is text-only]"
+            text = "[attachment not delivered: send audio as a voice note instead]"
         text = _strip_markdown(text).strip()
-        parts = _split_message(text, self.max_message_length)
+        # Reserve room for the timestamp prefix so stamped parts still fit.
+        budget = max(200, self.max_message_length - (40 if self.timestamps else 0))
+        parts = _split_message(text, budget)
         if not parts:
             return SendResult(success=False, error="Refusing to send an empty LXMF message")
+        if self.timestamps:
+            sent_at = time.time()
+            total = len(parts)
+            parts = [
+                f"{_outbound_stamp(sent_at, index, total)}{_strip_part_tag(part)}"
+                for index, part in enumerate(parts, 1)
+            ]
 
         last_id = None
-        for part in parts:
-            ok, reason, message_id = await self._send_text(destination, part)
+        for index, part in enumerate(parts):
+            ok, reason, message_id = await self._send_payload(
+                destination, part,
+                reply_to=reply_to if index == 0 else None)
             if not ok:
                 return SendResult(success=False, error=f"LXMF delivery failed: {reason}")
             last_id = message_id or last_id
         return SendResult(success=True, message_id=last_id)
 
-    async def _send_text(self, destination_hex: str, text: str) -> tuple[bool, str, Optional[str]]:
+    async def _send_payload(self, destination_hex: str, text: str, *,
+                            fields: Optional[dict[Any, Any]] = None,
+                            reply_to: Optional[str] = None
+                            ) -> tuple[bool, str, Optional[str]]:
+        """Send one LXMF payload DIRECT, falling back to store-and-forward."""
         import RNS
         import LXMF
 
@@ -1097,7 +1531,8 @@ class ReticulumAdapter(BasePlatformAdapter):
             logger.info("Reticulum: no path to %s; trying DIRECT anyway", _short(destination_hex))
 
         ok, reason, message_id = await self._send_with_method(
-            dest, text, LXMF.LXMessage.DIRECT, self.direct_timeout)
+            dest, text, LXMF.LXMessage.DIRECT, self.direct_timeout,
+            fields=fields, reply_to=reply_to)
         if ok:
             return True, reason, message_id
         logger.info("Reticulum: DIRECT to %s failed (%s)", _short(destination_hex), reason)
@@ -1114,15 +1549,24 @@ class ReticulumAdapter(BasePlatformAdapter):
         logger.info("Reticulum: sending to %s via propagation node %s",
                     _short(destination_hex), _short(node.hex()))
         return await self._send_with_method(
-            dest, text, LXMF.LXMessage.PROPAGATED, self.propagated_timeout)
+            dest, text, LXMF.LXMessage.PROPAGATED, self.propagated_timeout,
+            fields=fields, reply_to=reply_to)
 
-    async def _send_with_method(self, dest, text: str, method, timeout: float
+    async def _send_with_method(self, dest, text: str, method, timeout: float, *,
+                                fields: Optional[dict[Any, Any]] = None,
+                                reply_to: Optional[str] = None
                                 ) -> tuple[bool, str, Optional[str]]:
         import LXMF
 
         loop = asyncio.get_running_loop()
         done = asyncio.Event()
         outcome: dict[str, Any] = {"ok": False, "reason": "timeout", "id": None}
+        message_fields = dict(fields or {})
+        # Thread the reply anchor so the phone client can show the answer
+        # against the message it answers (LXMF FIELD_REPLY_TO).
+        if reply_to and _is_message_hash(reply_to):
+            message_fields.setdefault(
+                getattr(LXMF, "FIELD_REPLY_TO", 0x30), bytes.fromhex(reply_to.strip().lower()))
 
         def _finish(ok: bool, lxm) -> None:
             outcome["ok"] = ok
@@ -1144,6 +1588,7 @@ class ReticulumAdapter(BasePlatformAdapter):
                 self._stack.destination,
                 text,
                 desired_method=method,
+                fields=message_fields or None,
                 include_ticket=True,
             )
             lxm.register_delivery_callback(_on_delivered)
@@ -1157,8 +1602,9 @@ class ReticulumAdapter(BasePlatformAdapter):
 
         label = "PROPAGATED" if method == LXMF.LXMessage.PROPAGATED else "DIRECT"
         started = time.monotonic()
-        logger.info("Reticulum: %s send to %s (%d bytes); waiting up to %.0fs",
-                    label, _short(dest.hash.hex()), len(text.encode("utf-8")), timeout)
+        logger.info("Reticulum: %s send to %s (%d bytes%s); waiting up to %.0fs",
+                    label, _short(dest.hash.hex()), len(text.encode("utf-8")),
+                    f", {len(message_fields)} field(s)" if message_fields else "", timeout)
         try:
             await asyncio.wait_for(done.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -1177,6 +1623,93 @@ class ReticulumAdapter(BasePlatformAdapter):
                     "delivered" if outcome["ok"] else outcome["reason"],
                     time.monotonic() - started)
         return outcome["ok"], outcome["reason"], outcome["id"]
+
+    # -- voice out ------------------------------------------------------------
+
+    def _prepare_voice_payload(self, audio_path: str) -> tuple[Optional[bytes], str]:
+        """``(ogg_opus_bytes, error)`` for an outbound voice note.
+
+        Always Ogg/Opus: that is what Sideband and the other LXMF phone clients
+        play natively (AM_OPUS_OGG). The clip is capped at ``tts_max_bytes`` so
+        a long spoken reply cannot turn into a multi-minute LoRa transfer.
+        """
+        path = os.path.abspath(os.path.expanduser(str(audio_path or "")))
+        if not path or not os.path.isfile(path):
+            return None, f"audio file not found: {audio_path!r}"
+        if os.path.getsize(path) <= 0:
+            return None, "audio file is empty"
+        ogg_path = None
+        try:
+            ogg_path = _transcode_audio_file(path, self.audio_bitrate)
+            if ogg_path is None:
+                if Path(path).suffix.lower() in {".ogg", ".opus"}:
+                    ogg_path = path  # no ffmpeg: assume the caller supplied Opus
+                else:
+                    return None, "ffmpeg is not available to encode the voice note as Ogg/Opus"
+            size = os.path.getsize(ogg_path)
+            if size > self.tts_max_bytes:
+                # One retry at a lower bitrate before giving up on audio.
+                lean = _transcode_audio_file(path, "12k")
+                if lean and os.path.getsize(lean) <= self.tts_max_bytes:
+                    with contextlib.suppress(OSError):
+                        os.unlink(ogg_path)
+                    ogg_path, size = lean, os.path.getsize(lean)
+                else:
+                    if lean:
+                        with contextlib.suppress(OSError):
+                            os.unlink(lean)
+                    return None, (
+                        f"voice note is {size} bytes, over the {self.tts_max_bytes} byte "
+                        "mesh budget; raise RETICULUM_TTS_MAX_BYTES to allow it")
+            with open(ogg_path, "rb") as handle:
+                return handle.read(), ""
+        except Exception as exc:
+            return None, f"could not encode voice note: {exc}"
+        finally:
+            if ogg_path and ogg_path != path:
+                with contextlib.suppress(OSError):
+                    os.unlink(ogg_path)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None,
+                         metadata: Optional[dict[str, Any]] = None,
+                         **kwargs: Any) -> SendResult:
+        """Send a native LXMF voice note (FIELD_AUDIO, Ogg/Opus).
+
+        This is the TTS reply path: ``/voice on`` in a chat, or ``voice.auto_tts``
+        in config.yaml, makes the gateway synthesize spoken replies for voice
+        input and hand the file here.
+        """
+        if not self._running or self._stack is None:
+            return SendResult(success=False, error="Reticulum platform is not connected")
+        destination = _normalize_hash(chat_id)
+        if not _is_destination_hash(destination):
+            return SendResult(
+                success=False,
+                error=f"Invalid LXMF destination hash {chat_id!r} (expected 32 hex characters)")
+
+        audio, error = await asyncio.to_thread(self._prepare_voice_payload, audio_path)
+        if audio is None:
+            logger.warning("Reticulum: voice note to %s not sent: %s",
+                           _short(destination), error)
+            return SendResult(success=False, error=error)
+
+        body = _strip_markdown(_CONTROL_RE.sub("", caption or "")).strip()
+        if not body:
+            body = "[voice message]"
+        if self.timestamps:
+            body = f"{_outbound_stamp(time.time())}{body}"
+        import LXMF
+        ok, reason, message_id = await self._send_payload(
+            destination, body,
+            fields={getattr(LXMF, "FIELD_AUDIO", 0x07): [AUDIO_MODE_OPUS_OGG, audio]},
+            reply_to=reply_to)
+        if not ok:
+            logger.warning("Reticulum: voice note to %s failed: %s", _short(destination), reason)
+            return SendResult(success=False, error=f"LXMF voice delivery failed: {reason}")
+        logger.info("Reticulum: voice note (%d bytes) delivered to %s in %s",
+                    len(audio), _short(destination), reason)
+        return SendResult(success=True, message_id=message_id)
 
     def _outbound_worker(self, lxm) -> None:
         """Run ``handle_outbound`` off the event loop (it can block on the TX lock)."""
@@ -1266,6 +1799,11 @@ def _env_enablement() -> Optional[dict]:
         ("RETICULUM_ALLOW_ALL_USERS", "allow_all_users", _truthy),
         ("RETICULUM_DENY_REPLY", "deny_reply", _truthy),
         ("RETICULUM_PROPAGATED_FALLBACK", "propagated_fallback", _truthy),
+        ("RETICULUM_TIMESTAMPS", "timestamps", _truthy),
+        ("RETICULUM_REORDER_WINDOW", "reorder_window", float),
+        ("RETICULUM_AUDIO_BITRATE", "audio_bitrate", str),
+        ("RETICULUM_TTS_MAX_BYTES", "tts_max_bytes", int),
+        ("RETICULUM_MAX_AUDIO_BYTES", "max_audio_bytes", int),
     ), home_env="RETICULUM_HOME_CHANNEL")
     if not seed and not _truthy(platform_gate_env("RETICULUM_ENABLED")):
         return None
@@ -1300,6 +1838,9 @@ async def _standalone_send(
     text = _strip_markdown(text).strip()
     if not text:
         return send_error("Refusing to send an empty LXMF message")
+    if _truthy(_env_or_extra("RETICULUM_TIMESTAMPS", extra, "timestamps",
+                             DEFAULT_TIMESTAMPS), DEFAULT_TIMESTAMPS):
+        text = f"{_outbound_stamp(time.time())}{text}"
 
     timeout = max(10.0, _as_float(
         _env_or_extra("RETICULUM_DELIVERY_TIMEOUT", extra, "delivery_timeout",
@@ -1552,9 +2093,16 @@ def register(ctx) -> None:
         platform_hint=(
             "You are chatting over Reticulum/LXMF, an off-grid-capable mesh "
             "network. Clients include Sideband, Nomad Network and custom LXMF "
-            "apps. Messages are plain text; markdown is stripped. Bandwidth "
-            "may be very limited (LoRa), delivery can be slow, and the peer "
-            "may be offline (replies fall back to store-and-forward when a "
-            "propagation node is configured). Keep answers short and "
-            "self-contained; avoid large code blocks and attachments."),
+            "apps. Messages are plain text; markdown is stripped. Every message "
+            "you send is prefixed with a UTC send timestamp, and every incoming "
+            "message carries the sender's own timestamp — when one is marked "
+            "'out of order' it was sent before a message you already answered, "
+            "so place it at the right point in the conversation instead of "
+            "treating it as the newest. Voice notes arrive as audio and are "
+            "transcribed automatically; with voice replies enabled (/voice on) "
+            "your answer is also sent as an Ogg/Opus voice note. Bandwidth may be "
+            "very limited (LoRa), delivery can be slow, and the peer may be "
+            "offline (replies fall back to store-and-forward when a propagation "
+            "node is configured). Keep answers short and self-contained; avoid "
+            "large code blocks and attachments."),
     )
