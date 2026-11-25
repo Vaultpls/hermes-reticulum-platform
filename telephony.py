@@ -512,13 +512,24 @@ class TelephoneBridge:
 
     def _on_ringing(self, identity) -> None:
         caller = bytes(identity.hash).hex()
+        # The call identity hash is NOT an LXMF destination: replies sent to it
+        # fail with "unknown LXMF destination". Derive the peer's lxmf.delivery
+        # address from the identity carried in the link request.
+        reply_to = caller
+        try:
+            import RNS
+
+            reply_to = RNS.Destination.hash(identity, "lxmf", "delivery").hex()
+        except Exception:
+            logger.debug("Reticulum: could not derive an LXMF address for %s",
+                         caller, exc_info=True)
         path = os.path.join(
             self._calls_dir(),
             f"call_{caller[:12]}_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.ogg")
         os.makedirs(self._calls_dir(), exist_ok=True)
         with self._lock:
-            self._call = {"caller": caller, "path": path, "started_at": time.time(),
-                          "answered_at": None}
+            self._call = {"caller": caller, "reply_to": reply_to, "path": path,
+                          "started_at": time.time(), "answered_at": None}
             sink = self._sink
         # The ringing sink is built before this callback runs, so it still has
         # the throwaway path; retarget it at the real recording file.

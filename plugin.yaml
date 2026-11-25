@@ -55,8 +55,8 @@ optional_env:
     prompt: "Inbound stamp cost (default: 8; 0 = off)"
     password: false
   - name: RETICULUM_ANNOUNCE_INTERVAL
-    description: "Seconds between delivery announces (default: 900, minimum: 300)"
-    prompt: "Re-announce interval in seconds (default: 900)"
+    description: "Seconds between delivery announces (default: 3600, minimum: 3600 — faster announces are rate-blocked by receiving nodes)"
+    prompt: "Re-announce interval in seconds (default: 3600)"
     password: false
   - name: RETICULUM_PROPAGATION_NODE
     description: "LXMF propagation node hash for store-and-forward replies (optional; auto-selected from announces when blank)"
@@ -133,4 +133,12 @@ optional_env:
   - name: RETICULUM_CALL_GREETING_TEXT
     description: "Words spoken when a call is answered (default: Hermes here. Go ahead.)"
     prompt: "Spoken call greeting (optional)"
+    password: false
+  - name: RETICULUM_CALL_GREETING_VOICE
+    description: "edge-tts voice used for the spoken greeting (default: en-US-AriaNeural)"
+    prompt: "Greeting TTS voice (default: en-US-AriaNeural)"
+    password: false
+  - name: RETICULUM_CALL_ALLOW_PREFIXES
+    description: "Comma-separated caller-hash prefixes allowed to call even when not on RETICULUM_ALLOWED_USERS (dev bridge; exact hashes are preferred)"
+    prompt: "Allowed caller-hash prefixes (optional)"
     password: false

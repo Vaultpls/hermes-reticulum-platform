@@ -64,7 +64,7 @@ Environment variables take precedence over `platforms.reticulum.extra` in config
 | `RETICULUM_ALLOWED_USERS` | empty (deny all) | Comma-separated LXMF destination hashes allowed to talk to the bot |
 | `RETICULUM_ALLOW_ALL_USERS` | `false` | Allow any destination hash. Dev only, disables the allowlist |
 | `RETICULUM_STAMP_COST` | `8` | Proof-of-work stamp cost required from senders. `0` disables, clamped to 64 |
-| `RETICULUM_ANNOUNCE_INTERVAL` | `900` | Seconds between delivery announces. Values below 300 are raised to 300 |
+| `RETICULUM_ANNOUNCE_INTERVAL` | `3600` | Seconds between delivery announces. Values below 3600 are raised to 3600; RNS rate-limits announces per destination (`AR_TARGET`), so faster announcing gets the destination blocked on the mesh |
 | `RETICULUM_PROPAGATION_NODE` | empty | Propagation node hash for store-and-forward. Auto-selected from announces when blank |
 | `RETICULUM_AUTO_PROPAGATION_NODE` | `true` | Learn a propagation node from live announces when none is pinned |
 | `RETICULUM_PROPAGATION_SYNC_INTERVAL` | `60` | Seconds between LXMF propagation-node sync pulls (requesting mail queued for this destination). `0` disables |
@@ -84,6 +84,8 @@ Environment variables take precedence over `platforms.reticulum.extra` in config
 | `RETICULUM_CALL_PROFILE` | `auto` | Cap inbound call bandwidth (`ultra_low`, `very_low`, `low`, `medium`, `high`, `max`); `auto` honours the caller |
 | `RETICULUM_CALL_GREETING_TEXT` | `Hermes here. Go ahead.` | Words spoken on answer (rendered with edge-tts, cached) |
 | `RETICULUM_CALL_GREETING` | unset | Optional Ogg/Opus file played when a call is answered (overrides the spoken greeting) |
+| `RETICULUM_CALL_GREETING_VOICE` | `en-US-AriaNeural` | edge-tts voice used for the spoken greeting |
+| `RETICULUM_CALL_ALLOW_PREFIXES` | unset | Comma-separated caller-hash prefixes allowed despite not being on the allow-list (dev bridge; exact hashes preferred) |
 | `HERMES_RETICULUM_TEXT_BATCH_DELAY` | `1.5` | Quiet period used to merge rapid inbound messages into one turn |
 
 With no allowlist and no `RETICULUM_ALLOW_ALL_USERS`, the DM policy is `disabled` and every inbound message is ignored. Group policy is always `disabled`; LXMF has no group concept.

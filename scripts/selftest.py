@@ -201,6 +201,9 @@ def run_unit() -> int:
 
 class _AnnouncePrinter:
 
+    # RNS silently ignores announce handlers without this attribute.
+    aspect_filter = None
+
     def __init__(self, tag):
         self.tag = tag
 

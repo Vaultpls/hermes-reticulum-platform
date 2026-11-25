@@ -219,13 +219,17 @@ def run_client(workdir: str) -> int:
         "mixer_frames": [len(v) for v in (getattr(getattr(telephone, "transmit_mixer", None), "incoming_frames", {}) or {}).values()],
     }
     print("CLIENT DIAG", diag, flush=True)
+    # Read the negotiated profile while the call is still up: after hangup()
+    # active_call is gone and the field is always null.
+    profile_during_call = getattr(getattr(telephone, "active_call", None), "profile", None)
+    print("CLIENT PROFILE", profile_during_call, flush=True)
     time.sleep(CALL_SECONDS - 1.0)
     telephone.hangup()
     time.sleep(2)
     _write(os.path.join(workdir, "client-result.json"), {
         "heard": os.path.getsize(out_path) if os.path.isfile(out_path) else 0,
         "path": out_path,
-        "profile": getattr(getattr(telephone, "active_call", None), "profile", None),
+        "profile": profile_during_call,
     })
     return 0
 
@@ -275,6 +279,14 @@ def orchestrate() -> int:
         ("server transcript callback fired", "path" in server_result),
         ("client heard the greeting", int(client_result.get("heard") or 0) > 500),
     ]
+    expected_profiles = {
+        "ultra_low": 0x10, "very_low": 0x20, "low": 0x30, "medium": 0x40,
+        "high": 0x50, "max": 0x60,
+    }
+    wanted = expected_profiles.get(os.environ.get("RETICULUM_CALL_PROFILE", "").strip().lower())
+    if wanted is not None:
+        checks.append((f"call negotiated profile 0x{wanted:02x}",
+                       client_result.get("profile") == wanted))
     for label, ok in checks:
         print(("PASS " if ok else "FAIL ") + label)
     server_path = server_result.get("path")

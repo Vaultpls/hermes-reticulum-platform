@@ -27,7 +27,7 @@ Configuration (environment wins over ``platforms.reticulum.extra``):
     RETICULUM_STORAGE            identity + router storage  (default ~/.lxmf/storage)
     RETICULUM_CONFIG             Reticulum config dir       (default ~/.reticulum)
     RETICULUM_STAMP_COST         inbound PoW stamp cost     (default 8; 0 disables)
-    RETICULUM_ANNOUNCE_INTERVAL  re-announce seconds        (default 900)
+    RETICULUM_ANNOUNCE_INTERVAL  re-announce seconds        (default 3600)
     RETICULUM_ALLOWED_USERS      comma-separated LXMF hashes
     RETICULUM_ALLOW_ALL_USERS    "true" opens the DM policy (not recommended)
     RETICULUM_PROPAGATION_NODE   outbound LXMF propagation node hash
@@ -80,13 +80,13 @@ except ImportError:  # pragma: no cover - loaded as a top-level module
 DEFAULT_DISPLAY_NAME = "Hermes"
 DEFAULT_STORAGE_PATH = "~/.lxmf/storage"
 DEFAULT_STAMP_COST = 8
-DEFAULT_ANNOUNCE_INTERVAL = 900.0
+DEFAULT_ANNOUNCE_INTERVAL = 3600.0
 DEFAULT_DELIVERY_TIMEOUT = 150.0
 DEFAULT_PROPAGATED_TIMEOUT = 180.0
 DEFAULT_PROPAGATION_SYNC_INTERVAL = 60.0
 DEFAULT_MAX_MESSAGE_LENGTH = 1000
 DEFAULT_TEXT_BATCH_DELAY = 1.5
-MIN_ANNOUNCE_INTERVAL = 300.0  # RNS rate-limits announces; below this is pointless
+MIN_ANNOUNCE_INTERVAL = 3600.0  # RNS AR_TARGET: faster announces get rate-blocked
 MAX_MESSAGE_LENGTH = 8000
 
 # Voice (telephone-style use from Sideband and other LXMF phone clients).
@@ -794,6 +794,7 @@ class ReticulumAdapter(BasePlatformAdapter):
         self._telephone_missing_logged = False
         self._next_telephone_attempt = 0.0
         self._announce_thread: Optional[threading.Thread] = None
+        self._announce_stop = threading.Event()
         self._propagation_sync_task: Optional[asyncio.Task] = None
         self._running = False
         self._address_hex: Optional[str] = None
@@ -1086,6 +1087,13 @@ class ReticulumAdapter(BasePlatformAdapter):
         if not _is_destination_hash(caller):
             logger.warning("Reticulum: dropping call transcript with invalid caller %r", caller)
             return
+        # Prefer the LXMF delivery address derived from the caller's identity;
+        # the telephony identity hash itself is not deliverable over LXMF.
+        reply_to = str(call.get("reply_to") or "").strip().lower()
+        if not _is_destination_hash(reply_to):
+            reply_to = caller
+        if reply_to != caller:
+            logger.info("Reticulum: reply address for call from %s is %s", caller, reply_to)
         duration = float(call.get("duration") or 0.0)
         transcript = str(call.get("transcript") or "").strip()
         error = str(call.get("error") or "").strip()
@@ -1096,12 +1104,13 @@ class ReticulumAdapter(BasePlatformAdapter):
                     f"{error or 'no audio captured'}]")
         now = time.time()
         record = {
-            "source": caller,
+            "source": reply_to,
             "text": body,
             "timestamp": now,
             "received_at": now,
             "meta": {
-                "lxmf_source": caller,
+                "lxmf_source": reply_to,
+                "call_identity": caller,
                 "signature_validated": True,
                 "call": True,
                 "call_duration": duration,
@@ -1123,6 +1132,7 @@ class ReticulumAdapter(BasePlatformAdapter):
     def _start_announce_loop(self) -> None:
         if self._announce_thread is not None and self._announce_thread.is_alive():
             return
+        self._announce_stop.clear()
         self._announce_thread = threading.Thread(
             target=self._announce_job, name="reticulum-announce", daemon=True)
         self._announce_thread.start()
@@ -1134,8 +1144,9 @@ class ReticulumAdapter(BasePlatformAdapter):
         left the telephone destination unannounced until the next restart.
         """
         first = True
-        while self._running:
-            time.sleep(6.0 if first else self.announce_interval)
+        while self._running and not self._announce_stop.is_set():
+            if self._announce_stop.wait(6.0 if first else self.announce_interval):
+                break
             first = False
             if not self._running or self._stack is None:
                 continue
@@ -1152,12 +1163,21 @@ class ReticulumAdapter(BasePlatformAdapter):
                 suffix = ""
                 if self._telephone is not None:
                     suffix = f" + telephone {self._telephone.address or '?'}"
-                logger.info("Reticulum: announced %s%s", self._address_hex, suffix)
+                up = -1
+                try:
+                    import RNS
+
+                    up = sum(1 for iface in RNS.Transport.interfaces
+                             if getattr(iface, "online", False))
+                except Exception:
+                    pass
+                logger.info("Reticulum: announced %s%s (%d interfaces up)",
+                            self._address_hex, suffix, up)
             except Exception as exc:
                 logger.warning("Reticulum: re-announce failed: %s", exc)
 
     def _stop_announce_loop(self) -> None:
-        # The worker exits on its own when _running flips false.
+        self._announce_stop.set()
         self._announce_thread = None
 
     async def _propagation_sync_loop(self) -> None:
