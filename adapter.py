@@ -1124,10 +1124,10 @@ class ReticulumAdapter(BasePlatformAdapter):
         first = True
         try:
             while self._running:
-                # First pass is a warm-up: interfaces negotiate for a few
-                # seconds after startup, and an announce sent before the link
-                # is up teaches nobody a path.
-                await asyncio.sleep(20.0 if first else self.announce_interval)
+                # First pass is a short warm-up: TCP interfaces negotiate in a
+                # couple of seconds, and dialling the agent during that window
+                # fails because no announce has been sent yet.
+                await asyncio.sleep(6.0 if first else self.announce_interval)
                 first = False
                 if not self._running or self._stack is None:
                     continue
