@@ -17,6 +17,16 @@ storage/
 .lxmf/
 .reticulum/
 
+# Credentials and call recordings
+.env
+.env.*
+calls/
+*_utterances/
+*-utterances/
+*.ogg
+*.wav
+*.mp3
+
 # Self-test artifacts
 hermes-reticulum-selftest-*/
 *.log

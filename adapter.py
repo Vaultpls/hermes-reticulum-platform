@@ -99,6 +99,18 @@ DEFAULT_TTS_MAX_BYTES = 96 * 1024             # outbound voice-note cap (mesh bu
 DEFAULT_CALL_MAX_SECONDS = 300                # longest recorded LXST call
 DEFAULT_REORDER_WINDOW = 1.0                  # seconds to hold for late arrivals
 DEFAULT_TIMESTAMPS = True
+
+
+def _is_call_request(text: str) -> bool:
+    """Only standalone immediate requests trigger a call, never quoted prose."""
+    return bool(re.fullmatch(
+        r"\s*(?:please\s+)?(?:call me(?: back| up)?|give me a call|ring me|"
+        r"phone me|dial me|give me a ring|"
+        r"(?:can|could|would) you (?:call me(?: back| up)?|give me a call|"
+        r"ring me|phone me|dial me|give me a ring))"
+        r"(?:\s+(?:now|please))?[.!?]*\s*", text, re.IGNORECASE))
+
+
 MAX_REORDER_WINDOW = 30.0
 AUDIO_MODE_OPUS_OGG = 0x10
 _CODEC2_FFMPEG_MODES = {
@@ -787,6 +799,8 @@ class ReticulumAdapter(BasePlatformAdapter):
             DEFAULT_CALL_MAX_SECONDS, minimum=30, maximum=3600)
         self.call_greeting = _env_or_extra(
             "RETICULUM_CALL_GREETING", extra, "call_greeting", None)
+        self.call_live_transcription = _truthy(
+            _env_or_extra("RETICULUM_CALL_LIVE", extra, "call_live", True), True)
 
         self._stack: Optional[_BridgeStack] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1069,8 +1083,10 @@ class ReticulumAdapter(BasePlatformAdapter):
                 storage_path=self.storage_path,
                 allowed=lambda caller: self._is_allowed(caller),
                 on_transcript=self._on_call_transcript,
+                on_utterance=self._on_call_utterance if self.call_live_transcription else None,
                 greeting_path=self.call_greeting,
                 max_call_seconds=self.call_max_seconds,
+                live_transcription=self.call_live_transcription,
             )
             if bridge.start():
                 self._telephone = bridge
@@ -1081,11 +1097,60 @@ class ReticulumAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("Reticulum: telephone bridge failed to start")
 
+    def _on_call_utterance(self, call: dict) -> None:
+        """Dispatch one in-call utterance without waiting for hangup."""
+        caller = str(call.get("caller") or "").strip().lower()
+        reply_to = str(call.get("reply_to") or "").strip().lower()
+        if not _is_destination_hash(reply_to):
+            reply_to = caller
+        if not _is_destination_hash(reply_to):
+            logger.warning("Reticulum: dropping live call utterance with invalid caller %r", caller)
+            return
+        transcript = str(call.get("transcript") or "").strip()
+        if not transcript:
+            return
+        duration = float(call.get("utterance_duration") or 0.0)
+        index = int(call.get("utterance_index") or 0)
+        now = time.time()
+        record = {
+            "source": reply_to,
+            "text": f"[voice call, live {duration:.1f}s]\n{transcript}",
+            "timestamp": now,
+            "received_at": now,
+            "meta": {
+                "lxmf_source": reply_to,
+                "call_identity": caller,
+                "signature_validated": True,
+                "call": True,
+                "call_live": True,
+                "call_utterance": index,
+                "call_duration": duration,
+                "call_recording": call.get("path"),
+                "call_utterance_audio": call.get("utterance_path"),
+                "media_urls": [],
+                "media_types": [],
+                "media_filenames": [],
+            },
+            "message_id": f"{reply_to}:call:live:{index}",
+            "bypass_reorder": True,
+        }
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            logger.warning("Reticulum: live call utterance from %s dropped (no event loop)", caller)
+            return
+        loop.call_soon_threadsafe(self._submit_inbound, record)
+
     def _on_call_transcript(self, call: dict) -> None:
         """Turn a finished call into an ordinary inbound turn for the agent."""
         caller = str(call.get("caller") or "").strip().lower()
         if not _is_destination_hash(caller):
             logger.warning("Reticulum: dropping call transcript with invalid caller %r", caller)
+            return
+        if call.get("live"):
+            logger.info(
+                "Reticulum: call with %s ended after %d live utterance(s); "
+                "no duplicate end-of-call turn",
+                caller, int(call.get("utterances") or 0))
             return
         # Prefer the LXMF delivery address derived from the caller's identity;
         # the telephony identity hash itself is not deliverable over LXMF.
@@ -1426,7 +1491,7 @@ class ReticulumAdapter(BasePlatformAdapter):
             return
         self._order_seq += 1
         record["seq"] = self._order_seq
-        if self.reorder_window <= 0:
+        if record.get("bypass_reorder") or self.reorder_window <= 0:
             self._flush_records([record], source=record["source"])
             return
         source = record["source"]
@@ -1512,6 +1577,20 @@ class ReticulumAdapter(BasePlatformAdapter):
                                 timestamp: float, meta: dict,
                                 *, received_at: Optional[float] = None,
                                 out_of_order: bool = False) -> None:
+        if not meta.get("call") and not meta.get("media_urls") and _is_call_request(text):
+            # Consume exact chat commands here, before the LLM can turn them
+            # into a voice note, a promise, or an accidental second call.
+            if time.time() - timestamp > 120.0:
+                await self.send(source_hash, "That call request is old. Send 'call me' again when ready.")
+                return
+            try:
+                result = await asyncio.to_thread(self.call_peer, source_hash)
+            except Exception as exc:
+                logger.exception("Reticulum: call request failed")
+                result = {"success": False, "error": str(exc)}
+            if not result.get("success"):
+                await self.send(source_hash, "Cannot call: " + result.get("error", "dialing failed"))
+            return
         peer_name = self._stack.peer_names.get(source_hash) if self._stack else None
         short = f"lxmf:{_short(source_hash)}"
         session_source = self.build_source(
@@ -1558,7 +1637,12 @@ class ReticulumAdapter(BasePlatformAdapter):
         logger.debug("Reticulum: message from %s sent %s%s: %.80s",
                      _short(source_hash), _utc_stamp(timestamp),
                      " (late)" if out_of_order else "", text)
-        self._enqueue_text_event(event)
+        if meta.get("call_live"):
+            # A live phone turn is latency-sensitive: skip the 1.5s text
+            # batching window and hand it straight to the session runner.
+            await self.handle_message(event)
+        else:
+            self._enqueue_text_event(event)
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         return f"reticulum:{event.source.chat_id}"
@@ -1569,6 +1653,27 @@ class ReticulumAdapter(BasePlatformAdapter):
                 await self.send(source_hash, "Access not authorized.")
 
     # -- outbound ------------------------------------------------------------
+
+    def call_peer(self, chat_id: str) -> dict:
+        """Dial an authorized LXMF peer's telephone using its public identity."""
+        target = str(chat_id or "").strip()
+        if not _is_destination_hash(target):
+            return {"success": False, "error": "Expected a 32-character LXMF destination hash."}
+        target = target.lower()
+        if not self._is_allowed(target):
+            return {"success": False, "error": "Call destination is not authorized."}
+        bridge = self._telephone
+        if bridge is None:
+            return {"success": False, "error": "Telephone service is not running."}
+        if bridge.active_call():
+            return {"success": False, "error": "Telephone line is busy."}
+        identity = self._resolve_identity(bytes.fromhex(target))
+        if identity is None:
+            return {"success": False, "error": "Peer identity is unknown. Open Sideband and announce."}
+        import RNS
+        if RNS.Destination.hash(identity, "lxmf", "delivery").hex() != target:
+            return {"success": False, "error": "Recalled identity does not match the LXMF destination."}
+        return bridge.dial(identity, reply_to=target)
 
     def _resolve_identity(self, destination_hash: bytes):
         """Recall a peer identity, requesting a path and waiting if needed."""
@@ -1616,6 +1721,17 @@ class ReticulumAdapter(BasePlatformAdapter):
         if media_count and not text:
             text = "[attachment not delivered: send audio as a voice note instead]"
         text = _strip_markdown(text).strip()
+        # While a telephone call is up, the answer belongs in the caller's ear
+        # rather than in an LXMF chat that is not open. Speak it through the
+        # live LXST transmit mixer and keep the normal text path only as a
+        # fallback when synthesis is unavailable.
+        if text and self._telephone is not None and self._telephone.has_active_call(destination):
+            spoken = await asyncio.to_thread(self._telephone.speak, destination, text)
+            if spoken:
+                logger.info("Reticulum: reply spoken into live call with %s", _short(destination))
+                return SendResult(success=True, message_id=f"call:{int(time.time())}")
+            logger.warning("Reticulum: in-call TTS unavailable for %s; falling back to LXMF text",
+                           _short(destination))
         # Reserve room for the timestamp prefix so stamped parts still fit.
         budget = max(200, self.max_message_length - (40 if self.timestamps else 0))
         parts = _split_message(text, budget)
@@ -1818,6 +1934,16 @@ class ReticulumAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False,
                 error=f"Invalid LXMF destination hash {chat_id!r} (expected 32 hex characters)")
+
+        # A tool-generated voice clip or an auto-TTS file played during a call
+        # must go to the handset, not into the LXMF queue.
+        if self._telephone is not None and self._telephone.has_active_call(destination):
+            spoken = await asyncio.to_thread(
+                self._telephone.speak, destination, caption, audio_path)
+            if spoken:
+                logger.info("Reticulum: queued voice clip into live call with %s",
+                            _short(destination))
+                return SendResult(success=True, message_id=f"call:{int(time.time())}")
 
         audio, error = await asyncio.to_thread(self._prepare_voice_payload, audio_path)
         if audio is None:
@@ -2188,8 +2314,47 @@ def _name_tool(args: dict, **_: Any) -> str:
     return json.dumps(status)
 
 
+_CALL_TOOL_SCHEMA = {
+    "name": "reticulum_call",
+    "description": (
+        "Place an outgoing Reticulum/LXST voice call when the user asks 'call me', "
+        "'give me a call', or similar. With no destination, call the current "
+        "Reticulum chat sender. Only use this for an immediate call the user "
+        "asked for now, never for a scheduled or conditional request. Do not "
+        "substitute a voice note for an explicit call request. The destination, "
+        "if supplied, must be an allow-listed LXMF delivery hash, not a phone "
+        "number or telephone hash. Returns dialing, not proof of answer."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "destination": {"type": "string", "description":
+                            "Optional LXMF delivery hash; omit in a Reticulum chat to call its sender."},
+        },
+    },
+}
+
+
+def _call_tool(args: dict, **_: Any) -> str:
+    target = args.get("destination")
+    if not target:
+        from gateway.session_context import get_session_env
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "reticulum":
+            return json.dumps({"success": False, "error":
+                               "Specify an LXMF destination, or ask from your Reticulum chat."})
+        target = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    adapter = _LIVE_ADAPTER
+    if adapter is None:
+        return json.dumps({"success": False, "error": "Reticulum adapter is not connected."})
+    return json.dumps(adapter.call_peer(str(target)))
+
+
 def register(ctx) -> None:
     """Hermes plugin entry point."""
+    ctx.register_tool(
+        name="reticulum_call", toolset="reticulum", schema=_CALL_TOOL_SCHEMA,
+        handler=_call_tool, description="Call an authorized LXMF peer's handset on request",
+        emoji="📞",
+    )
     ctx.register_tool(
         name="reticulum_stamp_cost",
         toolset="reticulum",
@@ -2234,7 +2399,11 @@ def register(ctx) -> None:
             "so place it at the right point in the conversation instead of "
             "treating it as the newest. Voice notes arrive as audio and are "
             "transcribed automatically; with voice replies enabled (/voice on) "
-            "your answer is also sent as an Ogg/Opus voice note. Bandwidth may be "
+            "your answer is also sent as an Ogg/Opus voice note. You can make "
+            "outgoing LXST voice calls with reticulum_call when the user requests "
+            "an immediate call; omit destination to call this chat sender. Never "
+            "use it for a scheduled or conditional call. Do not substitute "
+            "a voice note for an explicitly requested phone call. Bandwidth may be "
             "very limited (LoRa), delivery can be slow, and the peer may be "
             "offline (replies fall back to store-and-forward when a propagation "
             "node is configured). Keep answers short and self-contained; avoid "

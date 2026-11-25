@@ -1,7 +1,7 @@
 name: reticulum-platform
 label: Reticulum (LXMF)
 kind: platform
-version: 2.2.0
+version: 2.1.0
 manifest_version: 2
 description: >
   Reticulum / LXMF gateway adapter for Hermes Agent. Runs an LXMF delivery
@@ -11,8 +11,10 @@ description: >
   notes (Ogg/Opus or Codec2) are transcribed by the gateway's STT pipeline,
   and replies can be spoken back as Ogg/Opus voice notes (TTS). Sideband can
   also place a real LXST telephone call: the adapter announces an
-  ``lxst.telephony`` destination, answers allow-listed callers, records the
-  call and hands the transcript to the agent. Every message carries a UTC
+  ``lxst.telephony`` destination, answers allow-listed callers, transcribes
+  each spoken utterance while the call is live, speaks the agent's reply
+  back into the handset, and can dial an allow-listed peer when asked to
+  call. Every message carries a UTC
   timestamp; out-of-order arrivals are reordered and flagged.
   Allow-listed by LXMF destination hash, with optional store-and-forward
   fallback through an LXMF propagation node.
@@ -22,10 +24,12 @@ homepage: https://github.com/Vaultpls/hermes-reticulum-platform
 provides_tools:
   - reticulum_stamp_cost
   - reticulum_display_name
+  - reticulum_call
 python_dependencies:
   - "rns>=1.6,<2"
   - "lxmf>=1.3,<2"
   - "lxst>=0.6.1,<0.7"
+  - "numpy>=2.3.4,<3"
 # ``requires_env`` and ``optional_env`` entries are surfaced in the
 # ``hermes config`` UI via the platform-plugin env var injector in
 # ``hermes_cli/config.py``.
@@ -119,11 +123,35 @@ optional_env:
     prompt: "Answer LXST telephone calls? (true/false)"
     password: false
   - name: RETICULUM_CALL_MAX_SECONDS
-    description: "Longest recorded telephone call in seconds before the adapter hangs up (default: 300)"
+    description: "Longest telephone call in seconds before the adapter hangs up (default: 300)"
     prompt: "Max call length in seconds (default: 300)"
     password: false
+  - name: RETICULUM_CALL_LIVE
+    description: "Transcribe utterances during the call and speak replies into the handset (default: true; false restores record-and-transcribe-on-hangup)"
+    prompt: "Live in-call voice? (true/false)"
+    password: false
+  - name: RETICULUM_VOICE_URL
+    description: "Base URL of a warm localhost GPU voice service (optional; enables GPU STT/TTS for calls)"
+    prompt: "GPU voice service URL (optional)"
+    password: false
+  - name: RETICULUM_CALL_STT_URL
+    description: "GPU STT endpoint base URL (optional; overrides RETICULUM_VOICE_URL for calls)"
+    prompt: "GPU STT service URL (optional)"
+    password: false
+  - name: RETICULUM_CALL_TTS_URL
+    description: "GPU TTS endpoint base URL (optional; overrides RETICULUM_VOICE_URL for calls)"
+    prompt: "GPU TTS service URL (optional)"
+    password: false
+  - name: RETICULUM_CALL_STT_LANGUAGE
+    description: "Language passed to the GPU STT service (default: en)"
+    prompt: "GPU STT language (default: en)"
+    password: false
+  - name: RETICULUM_CALL_STT_TIMEOUT
+    description: "Seconds to wait for the optional HTTP STT service before falling back (default: 30)"
+    prompt: "HTTP STT timeout in seconds (default: 30)"
+    password: false
   - name: RETICULUM_CALL_GREETING
-    description: "Optional Ogg/Opus file played when a call is answered (default: spoken greeting via edge-tts, else a short tone)"
+    description: "Optional Ogg/Opus file played when a call is answered (default: spoken greeting via the GPU voice service, else edge-tts)"
     prompt: "Call greeting Ogg/Opus path (optional)"
     password: false
   - name: RETICULUM_CALL_PROFILE
@@ -135,8 +163,12 @@ optional_env:
     prompt: "Spoken call greeting (optional)"
     password: false
   - name: RETICULUM_CALL_GREETING_VOICE
-    description: "edge-tts voice used for the spoken greeting (default: en-US-AriaNeural)"
-    prompt: "Greeting TTS voice (default: en-US-AriaNeural)"
+    description: "Fallback edge-tts voice used for the spoken greeting when the GPU voice service is unavailable (default: en-US-AriaNeural)"
+    prompt: "Fallback greeting voice (default: en-US-AriaNeural)"
+    password: false
+  - name: RETICULUM_CALL_TTS_VOICE
+    description: "edge-tts voice used for spoken replies when the GPU voice service is unavailable (default: the greeting voice)"
+    prompt: "Fallback edge-tts voice (default: greeting voice)"
     password: false
   - name: RETICULUM_CALL_ALLOW_PREFIXES
     description: "Comma-separated caller-hash prefixes allowed to call even when not on RETICULUM_ALLOWED_USERS (dev bridge; exact hashes are preferred)"

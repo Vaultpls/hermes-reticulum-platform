@@ -130,6 +130,28 @@ def run_unit() -> int:
     check("inbound stamp flags late", "out of order" in _inbound_stamp(now - 60, now, True))
     check("part tag stripped", _strip_part_tag("[3/9] hi") == "hi")
 
+    try:
+        import numpy as np
+        from call_audio import UtteranceSegmenter
+        sample_rate = 48000
+        tone = (np.sin(2 * np.pi * 440 * np.arange(sample_rate) / sample_rate)
+                * 0.25).reshape(-1, 1).astype("float32")
+        silence = np.zeros((sample_rate, 1), dtype="float32")
+        stream = np.concatenate([silence[:sample_rate // 2], tone, silence])
+        utterances: list[tuple[int, int]] = []
+        vad = UtteranceSegmenter(
+            lambda samples, rate: utterances.append((samples.shape[0], rate)),
+            sample_rate=sample_rate)
+        for offset in range(0, len(stream), 960):
+            vad.feed(stream[offset:offset + 960], sample_rate)
+        vad.flush()
+        check("call VAD finds one utterance", len(utterances) == 1, str(utterances))
+        if utterances:
+            duration = utterances[0][0] / utterances[0][1]
+            check("call VAD duration is sane", 0.8 <= duration <= 1.5, f"{duration:.2f}s")
+    except ImportError:
+        print("unit: skip call audio check (numpy unavailable)", flush=True)
+
     ogg_path = os.path.join(workdir, "tone.ogg")
     if _make_opus(ogg_path):
         class _Msg:

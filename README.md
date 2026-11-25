@@ -2,7 +2,7 @@
 
 Reticulum / LXMF platform adapter for [Hermes Agent](https://hermes-agent.nousresearch.com/docs). It turns a Hermes gateway into an LXMF delivery endpoint on a Reticulum mesh, so Sideband, Nomad Network and other LXMF clients can message the agent over LoRa, TCP, I2P or any Reticulum transport. No central messaging server is involved.
 
-Version 2.2.0. Text, voice notes and LXST telephone calls. Allow-listed by LXMF destination hash. Optional store-and-forward through an LXMF propagation node. Every message carries a UTC timestamp, and out-of-order arrivals are detected and ordered by the sender's own LXMF timestamp.
+Version 2.1.0. Text, voice notes and two-way LXST telephone calls, including outbound `call me` requests. Allow-listed by LXMF destination hash. Optional store-and-forward through an LXMF propagation node. Every message carries a UTC timestamp, and out-of-order arrivals are detected and ordered by the sender's own LXMF timestamp.
 
 ## How LXMF works
 
@@ -12,6 +12,7 @@ Reticulum is a cryptography-based mesh networking stack. Every participant has a
 
 - A working Reticulum config at `~/.reticulum` (or set `RETICULUM_CONFIG`).
 - The Python packages `rns` and `lxmf` installed into the same Python that runs the Hermes gateway.
+- `numpy>=2.3.4,<3` for call audio processing (declared in the plugin manifest and also required by LXST).
 - At least one peer that allow-lists this endpoint's LXMF address.
 - For telephone calls: the `lxst` package (`pip install lxst`, pulls `pycodec2`) and the system Opus libraries (`libopus0`, `libopusfile0`) on the gateway host. Without them the adapter logs one line and keeps running text-only.
 - For voice: `ffmpeg` on the gateway host (Codec2 ↔ Opus; most distro builds include libcodec2 and libopus) and a speech-to-text backend in Hermes. `stt.enabled: true` with `stt.provider: local` uses faster-whisper, which Hermes installs on first use; text-only operation needs neither.
@@ -80,15 +81,32 @@ Environment variables take precedence over `platforms.reticulum.extra` in config
 | `RETICULUM_TTS_MAX_BYTES` | `98304` | Largest outbound voice note in bytes (mesh budget). Over-budget clips are retried at 12k, then reported |
 | `RETICULUM_MAX_AUDIO_BYTES` | `4194304` | Largest inbound voice clip accepted, before Codec2 transcoding |
 | `RETICULUM_TELEPHONE` | `true` | Announce and answer an LXST telephone destination (needs `lxst`) |
-| `RETICULUM_CALL_MAX_SECONDS` | `300` | Longest recorded call before the adapter hangs up |
+| `RETICULUM_CALL_MAX_SECONDS` | `300` | Longest call before the adapter hangs up; the full conversation is still recorded |
+| `RETICULUM_CALL_LIVE` | `true` | Transcribe each utterance during the call and speak replies into the handset; `false` restores record-and-transcribe-on-hangup |
+| `RETICULUM_VOICE_URL` | unset | Base URL of a warm localhost GPU voice service; enables GPU STT/TTS for calls with automatic fallback |
+| `RETICULUM_CALL_STT_URL` | unset | GPU STT endpoint base URL (overrides `RETICULUM_VOICE_URL` for calls) |
+| `RETICULUM_CALL_TTS_URL` | unset | GPU TTS endpoint base URL (overrides `RETICULUM_VOICE_URL` for calls) |
+| `RETICULUM_CALL_STT_LANGUAGE` | `en` | Language passed to the GPU STT service |
+| `RETICULUM_CALL_STT_TIMEOUT` | `30` | Seconds to wait for the optional HTTP STT service before falling back |
 | `RETICULUM_CALL_PROFILE` | `auto` | Cap inbound call bandwidth (`ultra_low`, `very_low`, `low`, `medium`, `high`, `max`); `auto` honours the caller |
-| `RETICULUM_CALL_GREETING_TEXT` | `Hermes here. Go ahead.` | Words spoken on answer (rendered with edge-tts, cached) |
+| `RETICULUM_CALL_GREETING_TEXT` | `Hermes here. Go ahead.` | Words spoken on answer (rendered by the GPU voice service when configured, else edge-tts, and cached) |
 | `RETICULUM_CALL_GREETING` | unset | Optional Ogg/Opus file played when a call is answered (overrides the spoken greeting) |
-| `RETICULUM_CALL_GREETING_VOICE` | `en-US-AriaNeural` | edge-tts voice used for the spoken greeting |
+| `RETICULUM_CALL_GREETING_VOICE` | `en-US-AriaNeural` | Fallback edge-tts voice used for the spoken greeting |
+| `RETICULUM_CALL_TTS_VOICE` | greeting voice | Fallback edge-tts voice used for in-call replies |
 | `RETICULUM_CALL_ALLOW_PREFIXES` | unset | Comma-separated caller-hash prefixes allowed despite not being on the allow-list (dev bridge; exact hashes preferred) |
 | `HERMES_RETICULUM_TEXT_BATCH_DELAY` | `1.5` | Quiet period used to merge rapid inbound messages into one turn |
 
 With no allowlist and no `RETICULUM_ALLOW_ALL_USERS`, the DM policy is `disabled` and every inbound message is ignored. Group policy is always `disabled`; LXMF has no group concept.
+
+### Optional GPU voice service
+
+The plugin can use a warm localhost HTTP speech service for both directions. This removes model-loading and CPU-STT latency from a call:
+
+- `GET /health` reports the active STT device and TTS providers.
+- `POST /stt` with `{"path": "/absolute/audio.ogg", "language": "en"}` returns `{"success": true, "transcript": "..."}`.
+- `POST /tts` with `{"text": "..."}` returns `audio/wav`.
+
+Set `RETICULUM_VOICE_URL` (or the direction-specific overrides) to your service's base URL. The Reticulum bridge prefers it for live utterances, the greeting, and replies, and falls back to the gateway's configured STT and edge-tts if the service is down. The optional service and its models are not bundled with this plugin; provide a service implementing the contract above if you want GPU speech. Keep it bound to loopback because the STT request contains a local file path. Without a local TTS service, edge-tts sends the greeting and reply text to Microsoft's speech service.
 
 ## Security model
 
@@ -124,14 +142,21 @@ The voice note's body is a timestamped one-liner (`[2026-11-25 15:04:05Z] [voice
 
 Sideband can dial the agent. The adapter announces a second destination derived from the same identity, aspect `lxst.telephony`; for the current `~/.lxmf/storage` identity that address is printed in the gateway log as `Reticulum: telephone ready at <hash>`.
 
+Send `call me`, `give me a call`, `ring me`, `phone me`, `dial me`, or `can you call me?` in your Reticulum chat to have the agent ring your Sideband handset. Exact standalone requests bypass the model and start dialing directly. Broader requests can use the `reticulum_call` tool, which defaults to the current Reticulum chat sender. From another platform it requires an explicit LXMF delivery hash. Outgoing calls use the same allow-list, live STT/TTS, recording and barge-in as incoming calls. Open Sideband with telephone calls enabled and announce if the telephone route is unknown. Requests older than two minutes are not auto-dialed, and unanswered calls stop ringing after 75 seconds.
+
 - Only allow-listed callers are answered (`RETICULUM_ALLOWED_USERS`, same list as text). Everyone else gets the normal LXST rejection.
-- The call is answered after one ring, a spoken greeting plays, and the caller's audio is recorded to `<storage>/calls/call_<caller>_<utc>.ogg`.
-- On hangup the recording is transcribed with the gateway's STT backend and handed to the agent as an ordinary inbound turn, prefixed `[voice call, Ns]`. The agent's reply goes back over LXMF as a normal (optionally spoken) message, so the answer lands in the caller's chat.
-- Calls longer than `RETICULUM_CALL_MAX_SECONDS` are hung up; recordings stay on disk for auditing. The host needs no sound card: the adapter substitutes file-backed LXST sources and sinks for the microphone and speaker.
-- `RETICULUM_CALL_PROFILE` caps the bandwidth a call may use. `low` is Codec2 at 3.2 kbit/s (about 200 ms frames), `very_low` is 1.6 kbit/s and `ultra_low` is 700 bit/s. The caller's preference is downgraded and signalled back, so both ends use the same codec.
+- The call is answered after one ring and a spoken greeting plays. The caller can start talking as soon as they hear it.
+- Incoming audio is segmented on short pauses by an energy VAD in the receive sink. Each completed utterance is written to `<storage>/calls/call_<caller>_<utc>_utterances/utt_NNN.ogg`, transcribed with the GPU voice service when `RETICULUM_VOICE_URL` is set (otherwise the gateway's STT backend), and handed to the agent immediately as a `[voice call, live Ns]` turn. The ordinary 1.5 s text-batching and reorder windows are bypassed for these turns, since both would be audible dead air.
+- The agent's reply is intercepted while the call is up and synthesized directly into the LXST transmit path. With a GPU voice service configured, the greeting and reply are rendered by the warm local TTS; edge-tts is the fallback. `send()` and `send_voice()` both feed a queue-backed 48 kHz source on the negotiated mixer, so no LXMF round trip is needed for the answer. Speaking over the reply stops queued audio, so the caller can barge in.
+- If in-call TTS is unavailable, the reply falls back to the normal LXMF text path instead of being lost. The full call is still recorded at `<storage>/calls/call_<caller>_<utc>.ogg` for audit and diagnostics.
+- Barge-in clears queued reply audio and invalidates a TTS synthesis that has not finished yet, so a reply the caller spoke over cannot arrive late. If no live utterance produced a turn (for example STT failed), the bridge falls back to transcribing the full call recording; when at least one live turn was delivered, the end-of-call transcript is deliberately not repeated.
+- Calls longer than `RETICULUM_CALL_MAX_SECONDS` are hung up; recordings stay on disk. The host needs no sound card: the adapter substitutes queue- and file-backed LXST sources and sinks for the microphone and speaker.
+- `RETICULUM_CALL_PROFILE` caps the bandwidth a call may use. `low` is Codec2 at 3.2 kbit/s (about 200 ms frames), `very_low` is 1.6 kbit/s and `ultra_low` is 700 bit/s. The caller's preference is downgraded and signalled back, so both ends use the same codec. The 700/1600/3200 codecs on a mesh link are themselves noticeable latency; `medium` uses Opus at 24 kbit/s and is the lowest-latency choice when bandwidth allows.
+- Use `RETICULUM_CALL_PROFILE=medium` for Sideband handset calls. A loopback Codec2 test does not prove that a real handset can transmit audio at the `low` profile.
+- `RETICULUM_CALL_LIVE=false` restores the previous record-until-hangup behavior and its single post-call transcript.
 - If `lxst` is missing at startup the adapter retries every few minutes; installing the package does not require a config change.
 
-Test it without a phone: `python scripts/phone_selftest.py` starts two Reticulum instances on loopback, dials the bridge, sends a tone, and checks that both sides recorded audio and the transcript callback fired.
+The practical latency floor is one pause (`~0.65 s` of silence), plus STT, the model's turn, and TTS synthesis. There is no artificial quiet period once the utterance is dispatched. The bundled `scripts/phone_selftest.py` starts two Reticulum instances on loopback, dials the bridge, sends a tone, checks both directions recorded audio, exercises in-call segmentation, and verifies an in-call reply reaches the caller.
 
 ## Timestamps and out-of-order delivery
 
@@ -146,7 +171,11 @@ Mesh links are delay-tolerant, so messages can arrive out of order: a retry over
 
 ## Runtime stamp and name control
 
-The plugin registers two Hermes tools so the agent can reconfigure the endpoint itself, without editing env files or restarting:
+The plugin registers three Hermes tools for outbound calling and live endpoint controls:
+
+`reticulum_call`
+- `{}` calls the sender of the current Reticulum chat. `{"destination": "<LXMF delivery hash>"}` calls a specific allow-listed peer.
+- Returns `status: dialing` once a route exists and LXST starts the call. This is not proof the handset was answered. Busy, unauthorized, malformed and unreachable targets fail without dialing.
 
 `reticulum_stamp_cost`
 - `{"action": "get"}` returns `stamp_cost`, `enforcing_stamps`, the live address and the LXMF cap (100, so 99 is the maximum settable cost).
@@ -184,6 +213,8 @@ python3 scripts/selftest.py
 ```
 
 It needs `rns` and `lxmf` in the current Python and the Hermes source tree importable. If the gateway source is not at `~/.hermes/hermes-agent`, set `HERMES_SRC` to its location. Exit code 0 means the round trip worked. Set `KEEP_SELFTEST=1` to keep the temporary workdir with both logs.
+
+`PHONE_SELFTEST_OUTGOING=1 RETICULUM_CALL_PROFILE=medium python scripts/phone_selftest.py` tests the reverse direction: the bridge dials, the remote handset rings and answers, both directions carry audio, and a live utterance reaches the callback. `python scripts/test_outbound.py` covers command matching, sender resolution, allow-list enforcement and failure cleanup offline.
 
 ## Credits
 
