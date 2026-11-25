@@ -243,7 +243,7 @@ class TelephoneBridge:
             self.greeting_path = self._speech_greeting()
         try:
             self._install_headless_audio()
-            telephone = telephony.Telephone(
+            telephone = self._telephone_class(telephony)(
                 self.identity,
                 auto_answer=self.auto_answer,
                 allowed=self._caller_allowed,
@@ -382,6 +382,67 @@ class TelephoneBridge:
             logger.warning("Reticulum: could not synthesize the call greeting: %s", exc)
         return None
 
+    # Bandwidth caps for inbound calls. The caller proposes a profile and
+    # LXST normally honours it; RETICULUM_CALL_PROFILE caps it so a mesh link
+    # spends a few kbit/s instead of ~24 kbit/s on every call.
+    CALL_PROFILE_NAMES = {
+        "ultra_low": "BANDWIDTH_ULTRA_LOW",
+        "very_low": "BANDWIDTH_VERY_LOW",
+        "low": "BANDWIDTH_LOW",
+        "medium": "QUALITY_MEDIUM",
+        "high": "QUALITY_HIGH",
+        "max": "QUALITY_MAX",
+        "latency_low": "LATENCY_LOW",
+        "latency_ultra_low": "LATENCY_ULTRA_LOW",
+    }
+
+    def _profile_cap(self, telephony):
+        name = os.environ.get("RETICULUM_CALL_PROFILE", "auto").strip().lower()
+        if name in ("", "auto", "default", "caller"):
+            return None
+        attribute = self.CALL_PROFILE_NAMES.get(name)
+        if attribute is None:
+            logger.warning("Reticulum: unknown RETICULUM_CALL_PROFILE %r; using the caller's preference", name)
+            return None
+        return getattr(telephony.Profiles, attribute)
+
+    def _telephone_class(self, telephony):
+        cap = self._profile_cap(telephony)
+        if cap is None:
+            return telephony.Telephone
+        profiles = telephony.Profiles
+        logger.info("Reticulum: call profile capped at %s", profiles.profile_name(cap))
+
+        class CappedTelephone(telephony.Telephone):
+            def _clamp(self, profile):
+                if profile is None:
+                    return None
+                try:
+                    if profiles.profile_index(profile) > profiles.profile_index(cap):
+                        logger.info("Reticulum: downgrading call profile %s to %s",
+                                    profiles.profile_name(profile), profiles.profile_name(cap))
+                        return cap
+                except Exception:
+                    pass
+                return profile
+
+            def switch_profile(self, profile=None, from_signalling=False):
+                return super().switch_profile(self._clamp(profile), from_signalling)
+
+            def _Telephone__select_call_profile(self, profile=None):
+                clamped = self._clamp(profile if profile is not None
+                                      else profiles.DEFAULT_PROFILE)
+                result = super()._Telephone__select_call_profile(clamped)
+                # The caller proposed the profile; tell it which one we settled
+                # on so both ends encode and decode the same codec.
+                with contextlib.suppress(Exception):
+                    if self.active_call and getattr(self.active_call, "is_incoming", False):
+                        self.signal(telephony.Signalling.PREFERRED_PROFILE + clamped,
+                                    self.active_call)
+                return result
+
+        return CappedTelephone
+
     def _greeting_for(self, frame_ms: int) -> Optional[str]:
         """Greeting Ogg/Opus with frames of exactly ``frame_ms``.
 
@@ -475,6 +536,13 @@ class TelephoneBridge:
             call = dict(self._call)
         logger.info("Reticulum: call with %s established; recording to %s",
                     call["caller"], call["path"])
+        telephone = self._telephone
+        profile = getattr(getattr(telephone, "active_call", None), "profile", None)
+        if profile is not None and self._telephony_module is not None:
+            with contextlib.suppress(Exception):
+                logger.info("Reticulum: call profile %s (%s)",
+                            self._telephony_module.Profiles.profile_name(profile),
+                            hex(profile))
         self._watchdog = threading.Thread(
             target=self._enforce_call_limit, args=(call["started_at"],),
             name="lxst-call-limit", daemon=True)

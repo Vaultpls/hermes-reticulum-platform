@@ -81,7 +81,9 @@ Environment variables take precedence over `platforms.reticulum.extra` in config
 | `RETICULUM_MAX_AUDIO_BYTES` | `4194304` | Largest inbound voice clip accepted, before Codec2 transcoding |
 | `RETICULUM_TELEPHONE` | `true` | Announce and answer an LXST telephone destination (needs `lxst`) |
 | `RETICULUM_CALL_MAX_SECONDS` | `300` | Longest recorded call before the adapter hangs up |
-| `RETICULUM_CALL_GREETING` | unset | Optional Ogg/Opus file played when a call is answered (default: generated tone) |
+| `RETICULUM_CALL_PROFILE` | `auto` | Cap inbound call bandwidth (`ultra_low`, `very_low`, `low`, `medium`, `high`, `max`); `auto` honours the caller |
+| `RETICULUM_CALL_GREETING_TEXT` | `Hermes here. Go ahead.` | Words spoken on answer (rendered with edge-tts, cached) |
+| `RETICULUM_CALL_GREETING` | unset | Optional Ogg/Opus file played when a call is answered (overrides the spoken greeting) |
 | `HERMES_RETICULUM_TEXT_BATCH_DELAY` | `1.5` | Quiet period used to merge rapid inbound messages into one turn |
 
 With no allowlist and no `RETICULUM_ALLOW_ALL_USERS`, the DM policy is `disabled` and every inbound message is ignored. Group policy is always `disabled`; LXMF has no group concept.
@@ -121,9 +123,10 @@ The voice note's body is a timestamped one-liner (`[2026-11-25 15:04:05Z] [voice
 Sideband can dial the agent. The adapter announces a second destination derived from the same identity, aspect `lxst.telephony`; for the current `~/.lxmf/storage` identity that address is printed in the gateway log as `Reticulum: telephone ready at <hash>`.
 
 - Only allow-listed callers are answered (`RETICULUM_ALLOWED_USERS`, same list as text). Everyone else gets the normal LXST rejection.
-- The call is answered after one ring, a short tone plays, and the caller's audio is recorded to `<storage>/calls/call_<caller>_<utc>.ogg`.
+- The call is answered after one ring, a spoken greeting plays, and the caller's audio is recorded to `<storage>/calls/call_<caller>_<utc>.ogg`.
 - On hangup the recording is transcribed with the gateway's STT backend and handed to the agent as an ordinary inbound turn, prefixed `[voice call, Ns]`. The agent's reply goes back over LXMF as a normal (optionally spoken) message, so the answer lands in the caller's chat.
 - Calls longer than `RETICULUM_CALL_MAX_SECONDS` are hung up; recordings stay on disk for auditing. The host needs no sound card: the adapter substitutes file-backed LXST sources and sinks for the microphone and speaker.
+- `RETICULUM_CALL_PROFILE` caps the bandwidth a call may use. `low` is Codec2 at 3.2 kbit/s (about 200 ms frames), `very_low` is 1.6 kbit/s and `ultra_low` is 700 bit/s. The caller's preference is downgraded and signalled back, so both ends use the same codec.
 - If `lxst` is missing at startup the adapter retries every few minutes; installing the package does not require a config change.
 
 Test it without a phone: `python scripts/phone_selftest.py` starts two Reticulum instances on loopback, dials the bridge, sends a tone, and checks that both sides recorded audio and the transcript callback fired.

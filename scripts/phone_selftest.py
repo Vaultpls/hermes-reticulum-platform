@@ -225,6 +225,7 @@ def run_client(workdir: str) -> int:
     _write(os.path.join(workdir, "client-result.json"), {
         "heard": os.path.getsize(out_path) if os.path.isfile(out_path) else 0,
         "path": out_path,
+        "profile": getattr(getattr(telephone, "active_call", None), "profile", None),
     })
     return 0
 
@@ -284,7 +285,7 @@ def orchestrate() -> int:
         print("heard:", _ffprobe(client_path))
     ok = all(item[1] for item in checks)
     print("PHONE SELFTEST " + ("PASS" if ok else "FAIL") + f"  (workdir {workdir})")
-    if ok:
+    if ok and os.environ.get("PHONE_SELFTEST_KEEP") != "1":
         shutil.rmtree(workdir, ignore_errors=True)
     return 0 if ok else 1
 

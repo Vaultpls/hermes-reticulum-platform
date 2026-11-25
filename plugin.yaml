@@ -123,6 +123,14 @@ optional_env:
     prompt: "Max call length in seconds (default: 300)"
     password: false
   - name: RETICULUM_CALL_GREETING
-    description: "Optional Ogg/Opus file played when a call is answered (default: generated tone)"
+    description: "Optional Ogg/Opus file played when a call is answered (default: spoken greeting via edge-tts, else a short tone)"
     prompt: "Call greeting Ogg/Opus path (optional)"
+    password: false
+  - name: RETICULUM_CALL_PROFILE
+    description: "Cap inbound call bandwidth: ultra_low, very_low, low, medium, high, max, or auto to honour the caller (default: auto)"
+    prompt: "Max call profile (default: auto)"
+    password: false
+  - name: RETICULUM_CALL_GREETING_TEXT
+    description: "Words spoken when a call is answered (default: Hermes here. Go ahead.)"
+    prompt: "Spoken call greeting (optional)"
     password: false
