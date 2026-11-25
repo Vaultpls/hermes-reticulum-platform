@@ -391,12 +391,21 @@ class TelephoneBridge:
     # -- call handling -------------------------------------------------------
 
     def _caller_allowed(self, identity_hash) -> bool:
+        caller = bytes(identity_hash).hex()
         try:
-            allowed = bool(self.allowed(bytes(identity_hash).hex()))
+            allowed = bool(self.allowed(caller))
         except Exception:
             logger.exception("Reticulum: caller allow-list check failed")
             allowed = False
-        logger.info("Reticulum: call from %s %s", bytes(identity_hash).hex()[:12],
+        if not allowed:
+            # Temporary bridge for clients that place calls from a second
+            # identity: allow callers whose hash starts with an approved
+            # prefix. Exact allow-list entries remain the primary control.
+            prefixes = [p.strip().lower() for p in
+                        os.environ.get("RETICULUM_CALL_ALLOW_PREFIXES", "").split(",")
+                        if p.strip()]
+            allowed = any(caller.startswith(prefix) for prefix in prefixes)
+        logger.info("Reticulum: call from %s %s", caller,
                     "allowed" if allowed else "not on the allow-list")
         return allowed
 
