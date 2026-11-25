@@ -793,7 +793,7 @@ class ReticulumAdapter(BasePlatformAdapter):
         self._telephone: Optional[TelephoneBridge] = None
         self._telephone_missing_logged = False
         self._next_telephone_attempt = 0.0
-        self._announce_task: Optional[asyncio.Task] = None
+        self._announce_thread: Optional[threading.Thread] = None
         self._propagation_sync_task: Optional[asyncio.Task] = None
         self._running = False
         self._address_hex: Optional[str] = None
@@ -1120,47 +1120,45 @@ class ReticulumAdapter(BasePlatformAdapter):
 
     # -- announce loop -------------------------------------------------------
 
-    async def _announce_loop(self) -> None:
-        first = True
-        try:
-            while self._running:
-                # First pass is a short warm-up: TCP interfaces negotiate in a
-                # couple of seconds, and dialling the agent during that window
-                # fails because no announce has been sent yet.
-                await asyncio.sleep(6.0 if first else self.announce_interval)
-                first = False
-                if not self._running or self._stack is None:
-                    continue
-                try:
-                    await asyncio.to_thread(self._stack.announce)
-                    if self._telephone is not None:
-                        await asyncio.to_thread(self._telephone.announce)
-                    elif (self.telephone_enabled
-                          and time.time() >= self._next_telephone_attempt):
-                        # lxst can appear after startup (package installs, env
-                        # rebuilds); retry without requiring a gateway restart.
-                        self._next_telephone_attempt = time.time() + 600.0
-                        self._start_telephone(self._stack)
-                    suffix = ""
-                    if self._telephone is not None:
-                        suffix = f" + telephone {self._telephone.address or '?'}"
-                    logger.info("Reticulum: announced %s%s", self._address_hex, suffix)
-                except Exception as exc:
-                    logger.warning("Reticulum: re-announce failed: %s", exc)
-        except asyncio.CancelledError:
-            pass
-
     def _start_announce_loop(self) -> None:
-        if self._loop is None or self._loop.is_closed():
+        if self._announce_thread is not None and self._announce_thread.is_alive():
             return
-        if self._announce_task is not None and not self._announce_task.done():
-            return
-        self._announce_task = self._loop.create_task(self._announce_loop())
+        self._announce_thread = threading.Thread(
+            target=self._announce_job, name="reticulum-announce", daemon=True)
+        self._announce_thread.start()
+
+    def _announce_job(self) -> None:
+        """Announce from a dedicated thread.
+
+        The asyncio version silently stopped after its first pass, which
+        left the telephone destination unannounced until the next restart.
+        """
+        first = True
+        while self._running:
+            time.sleep(6.0 if first else self.announce_interval)
+            first = False
+            if not self._running or self._stack is None:
+                continue
+            try:
+                self._stack.announce()
+                if self._telephone is not None:
+                    self._telephone.announce()
+                elif (self.telephone_enabled
+                      and time.time() >= self._next_telephone_attempt):
+                    # lxst can appear after startup (package installs, env
+                    # rebuilds); retry without requiring a gateway restart.
+                    self._next_telephone_attempt = time.time() + 600.0
+                    self._start_telephone(self._stack)
+                suffix = ""
+                if self._telephone is not None:
+                    suffix = f" + telephone {self._telephone.address or '?'}"
+                logger.info("Reticulum: announced %s%s", self._address_hex, suffix)
+            except Exception as exc:
+                logger.warning("Reticulum: re-announce failed: %s", exc)
 
     def _stop_announce_loop(self) -> None:
-        task, self._announce_task = self._announce_task, None
-        if task is not None and not task.done():
-            task.cancel()
+        # The worker exits on its own when _running flips false.
+        self._announce_thread = None
 
     async def _propagation_sync_loop(self) -> None:
         # Give paths and the first auto-selected propagation node ~20s to
