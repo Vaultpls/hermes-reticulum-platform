@@ -392,10 +392,13 @@ class TelephoneBridge:
 
     def _caller_allowed(self, identity_hash) -> bool:
         try:
-            return bool(self.allowed(bytes(identity_hash).hex()))
+            allowed = bool(self.allowed(bytes(identity_hash).hex()))
         except Exception:
             logger.exception("Reticulum: caller allow-list check failed")
-            return False
+            allowed = False
+        logger.info("Reticulum: call from %s %s", bytes(identity_hash).hex()[:12],
+                    "allowed" if allowed else "not on the allow-list")
+        return allowed
 
     def _on_ringing(self, identity) -> None:
         caller = bytes(identity.hash).hex()
