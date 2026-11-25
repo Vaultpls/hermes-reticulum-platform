@@ -2,7 +2,7 @@
 
 Reticulum / LXMF platform adapter for [Hermes Agent](https://hermes-agent.nousresearch.com/docs). It turns a Hermes gateway into an LXMF delivery endpoint on a Reticulum mesh, so Sideband, Nomad Network and other LXMF clients can message the agent over LoRa, TCP, I2P or any Reticulum transport. No central messaging server is involved.
 
-Version 2.1.0. Text and voice. Allow-listed by LXMF destination hash. Optional store-and-forward through an LXMF propagation node. Every message carries a UTC timestamp, and out-of-order arrivals are detected and ordered by the sender's own LXMF timestamp.
+Version 2.2.0. Text, voice notes and LXST telephone calls. Allow-listed by LXMF destination hash. Optional store-and-forward through an LXMF propagation node. Every message carries a UTC timestamp, and out-of-order arrivals are detected and ordered by the sender's own LXMF timestamp.
 
 ## How LXMF works
 
@@ -13,6 +13,7 @@ Reticulum is a cryptography-based mesh networking stack. Every participant has a
 - A working Reticulum config at `~/.reticulum` (or set `RETICULUM_CONFIG`).
 - The Python packages `rns` and `lxmf` installed into the same Python that runs the Hermes gateway.
 - At least one peer that allow-lists this endpoint's LXMF address.
+- For telephone calls: the `lxst` package (`pip install lxst`, pulls `pycodec2`) and the system Opus libraries (`libopus0`, `libopusfile0`) on the gateway host. Without them the adapter logs one line and keeps running text-only.
 - For voice: `ffmpeg` on the gateway host (Codec2 ↔ Opus; most distro builds include libcodec2 and libopus) and a speech-to-text backend in Hermes. `stt.enabled: true` with `stt.provider: local` uses faster-whisper, which Hermes installs on first use; text-only operation needs neither.
 
 ## Install
@@ -20,7 +21,7 @@ Reticulum is a cryptography-based mesh networking stack. Every participant has a
 1. Install the Reticulum packages into the Hermes runtime Python:
 
    ```
-   pip install rns lxmf
+   pip install rns lxmf lxst
    ```
 
    Use the interpreter that runs the gateway (the venv or system Python behind `hermes`), not a separate environment.
@@ -78,6 +79,9 @@ Environment variables take precedence over `platforms.reticulum.extra` in config
 | `RETICULUM_AUDIO_BITRATE` | `24k` | Opus bitrate for outbound voice notes |
 | `RETICULUM_TTS_MAX_BYTES` | `98304` | Largest outbound voice note in bytes (mesh budget). Over-budget clips are retried at 12k, then reported |
 | `RETICULUM_MAX_AUDIO_BYTES` | `4194304` | Largest inbound voice clip accepted, before Codec2 transcoding |
+| `RETICULUM_TELEPHONE` | `true` | Announce and answer an LXST telephone destination (needs `lxst`) |
+| `RETICULUM_CALL_MAX_SECONDS` | `300` | Longest recorded call before the adapter hangs up |
+| `RETICULUM_CALL_GREETING` | unset | Optional Ogg/Opus file played when a call is answered (default: generated tone) |
 | `HERMES_RETICULUM_TEXT_BATCH_DELAY` | `1.5` | Quiet period used to merge rapid inbound messages into one turn |
 
 With no allowlist and no `RETICULUM_ALLOW_ALL_USERS`, the DM policy is `disabled` and every inbound message is ignored. Group policy is always `disabled`; LXMF has no group concept.
@@ -111,6 +115,18 @@ Outbound:
 - Clips over `RETICULUM_TTS_MAX_BYTES` are re-encoded once at 12 kbps and, if still too large, are skipped with a logged reason. A long spoken answer must not turn into a multi-minute LoRa transfer; the text reply still goes out.
 
 The voice note's body is a timestamped one-liner (`[2026-11-25 15:04:05Z] [voice message]`), and the reply anchor is carried in `FIELD_REPLY_TO` so the phone can thread it against the message it answers.
+
+## Telephone calls (LXST)
+
+Sideband can dial the agent. The adapter announces a second destination derived from the same identity, aspect `lxst.telephony`; for the current `~/.lxmf/storage` identity that address is printed in the gateway log as `Reticulum: telephone ready at <hash>`.
+
+- Only allow-listed callers are answered (`RETICULUM_ALLOWED_USERS`, same list as text). Everyone else gets the normal LXST rejection.
+- The call is answered after one ring, a short tone plays, and the caller's audio is recorded to `<storage>/calls/call_<caller>_<utc>.ogg`.
+- On hangup the recording is transcribed with the gateway's STT backend and handed to the agent as an ordinary inbound turn, prefixed `[voice call, Ns]`. The agent's reply goes back over LXMF as a normal (optionally spoken) message, so the answer lands in the caller's chat.
+- Calls longer than `RETICULUM_CALL_MAX_SECONDS` are hung up; recordings stay on disk for auditing. The host needs no sound card: the adapter substitutes file-backed LXST sources and sinks for the microphone and speaker.
+- If `lxst` is missing at startup the adapter retries every few minutes; installing the package does not require a config change.
+
+Test it without a phone: `python scripts/phone_selftest.py` starts two Reticulum instances on loopback, dials the bridge, sends a tone, and checks that both sides recorded audio and the transcript callback fired.
 
 ## Timestamps and out-of-order delivery
 

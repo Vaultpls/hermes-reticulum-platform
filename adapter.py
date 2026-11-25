@@ -72,6 +72,11 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
 
+try:  # package import (normal plugin load)
+    from .telephony import TelephoneBridge
+except ImportError:  # pragma: no cover - loaded as a top-level module
+    from telephony import TelephoneBridge  # type: ignore[no-redef]
+
 DEFAULT_DISPLAY_NAME = "Hermes"
 DEFAULT_STORAGE_PATH = "~/.lxmf/storage"
 DEFAULT_STAMP_COST = 8
@@ -91,6 +96,7 @@ MAX_MESSAGE_LENGTH = 8000
 DEFAULT_AUDIO_BITRATE = "24k"
 DEFAULT_MAX_AUDIO_BYTES = 4 * 1024 * 1024      # inbound clip cap (before transcode)
 DEFAULT_TTS_MAX_BYTES = 96 * 1024             # outbound voice-note cap (mesh budget)
+DEFAULT_CALL_MAX_SECONDS = 300                # longest recorded LXST call
 DEFAULT_REORDER_WINDOW = 1.0                  # seconds to hold for late arrivals
 DEFAULT_TIMESTAMPS = True
 MAX_REORDER_WINDOW = 30.0
@@ -771,8 +777,22 @@ class ReticulumAdapter(BasePlatformAdapter):
                           DEFAULT_TTS_MAX_BYTES),
             DEFAULT_TTS_MAX_BYTES, minimum=8 * 1024, maximum=16 * 1024 * 1024)
 
+        # Telephone (LXST): answer allow-listed callers, record the call, and
+        # hand the transcript to the agent. Optional: needs the lxst package.
+        self.telephone_enabled = _truthy(
+            _env_or_extra("RETICULUM_TELEPHONE", extra, "telephone", True), True)
+        self.call_max_seconds = _as_int(
+            _env_or_extra("RETICULUM_CALL_MAX_SECONDS", extra, "call_max_seconds",
+                          DEFAULT_CALL_MAX_SECONDS),
+            DEFAULT_CALL_MAX_SECONDS, minimum=30, maximum=3600)
+        self.call_greeting = _env_or_extra(
+            "RETICULUM_CALL_GREETING", extra, "call_greeting", None)
+
         self._stack: Optional[_BridgeStack] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._telephone: Optional[TelephoneBridge] = None
+        self._telephone_missing_logged = False
+        self._next_telephone_attempt = 0.0
         self._announce_task: Optional[asyncio.Task] = None
         self._propagation_sync_task: Optional[asyncio.Task] = None
         self._running = False
@@ -809,13 +829,15 @@ class ReticulumAdapter(BasePlatformAdapter):
 
         logger.info(
             "Reticulum adapter initialized: name=%s storage=%s stamp=%s allow_all=%s "
-            "allowed=%d propagation_node=%s fallback=%s timestamps=%s reorder=%.1fs voice=%s",
+            "allowed=%d propagation_node=%s fallback=%s timestamps=%s reorder=%.1fs "
+            "voice=%s telephone=%s",
             self.display_name, self.storage_path,
             self.stamp_cost if self.stamp_cost else "off",
             self._allow_all(), len(self._allowed_users()),
             self.propagation_node or ("auto" if self.auto_propagation_node else "none"),
             self.propagated_fallback, self.timestamps, self.reorder_window,
-            f"opus@{self.audio_bitrate}")
+            f"opus@{self.audio_bitrate}",
+            f"on (max {self.call_max_seconds}s)" if self.telephone_enabled else "off")
 
     # -- address / display ---------------------------------------------------
 
@@ -984,6 +1006,7 @@ class ReticulumAdapter(BasePlatformAdapter):
         stack.configured_pn = None
         stack.auto_propagation_node = self.auto_propagation_node
         stack.set_configured_propagation_node(self.propagation_node)
+        self._start_telephone(stack)
 
         import RNS
         self._address_hex = RNS.prettyhexrep(stack.destination.hash)
@@ -1007,6 +1030,10 @@ class ReticulumAdapter(BasePlatformAdapter):
             _LIVE_ADAPTER = None
         self._stop_announce_loop()
         self._stop_propagation_sync_loop()
+        if self._telephone is not None:
+            with contextlib.suppress(Exception):
+                self._telephone.stop()
+            self._telephone = None
         # Drop any partially held reorder batches: a reconnect must not replay
         # messages captured before the disconnect under a stale timer.
         for task in list(self._order_tasks.values()):
@@ -1019,17 +1046,103 @@ class ReticulumAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("Reticulum: adapter disconnected (RNS stack retained)")
 
+    # -- telephone -----------------------------------------------------------
+
+    def _start_telephone(self, stack: "_BridgeStack") -> None:
+        """Announce an LXST telephone destination and answer allowed callers."""
+        if not self.telephone_enabled:
+            logger.info("Reticulum: telephone disabled (RETICULUM_TELEPHONE=false)")
+            return
+        try:
+            import importlib.util
+            if importlib.util.find_spec("LXST") is None:
+                if not self._telephone_missing_logged:
+                    logger.info(
+                        "Reticulum: telephone needs the optional lxst package; "
+                        "run `pip install lxst` in the gateway environment "
+                        "(the adapter retries periodically)")
+                    self._telephone_missing_logged = True
+                return
+            bridge = TelephoneBridge(
+                stack.identity,
+                storage_path=self.storage_path,
+                allowed=lambda caller: self._is_allowed(caller),
+                on_transcript=self._on_call_transcript,
+                greeting_path=self.call_greeting,
+                max_call_seconds=self.call_max_seconds,
+            )
+            if bridge.start():
+                self._telephone = bridge
+            else:
+                logger.info(
+                    "Reticulum: telephone unavailable — install the optional lxst "
+                    "package (pip install lxst) and restart the gateway")
+        except Exception:
+            logger.exception("Reticulum: telephone bridge failed to start")
+
+    def _on_call_transcript(self, call: dict) -> None:
+        """Turn a finished call into an ordinary inbound turn for the agent."""
+        caller = str(call.get("caller") or "").strip().lower()
+        if not _is_destination_hash(caller):
+            logger.warning("Reticulum: dropping call transcript with invalid caller %r", caller)
+            return
+        duration = float(call.get("duration") or 0.0)
+        transcript = str(call.get("transcript") or "").strip()
+        error = str(call.get("error") or "").strip()
+        if transcript:
+            body = f"[voice call, {duration:.0f}s]\n{transcript}"
+        else:
+            body = (f"[voice call, {duration:.0f}s — no transcript: "
+                    f"{error or 'no audio captured'}]")
+        now = time.time()
+        record = {
+            "source": caller,
+            "text": body,
+            "timestamp": now,
+            "received_at": now,
+            "meta": {
+                "lxmf_source": caller,
+                "signature_validated": True,
+                "call": True,
+                "call_duration": duration,
+                "call_recording": call.get("path"),
+                "media_urls": [],
+                "media_types": [],
+                "media_filenames": [],
+            },
+            "message_id": None,
+        }
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            logger.warning("Reticulum: call transcript from %s dropped (no event loop)", caller)
+            return
+        loop.call_soon_threadsafe(self._submit_inbound, record)
+
     # -- announce loop -------------------------------------------------------
 
     async def _announce_loop(self) -> None:
+        first = True
         try:
             while self._running:
-                await asyncio.sleep(self.announce_interval)
+                # First pass is a warm-up: interfaces negotiate for a few
+                # seconds after startup, and an announce sent before the link
+                # is up teaches nobody a path.
+                await asyncio.sleep(20.0 if first else self.announce_interval)
+                first = False
                 if not self._running or self._stack is None:
                     continue
                 try:
                     await asyncio.to_thread(self._stack.announce)
-                    logger.debug("Reticulum: re-announced %s", self._address_hex)
+                    if self._telephone is not None:
+                        await asyncio.to_thread(self._telephone.announce)
+                    elif (self.telephone_enabled
+                          and time.time() >= self._next_telephone_attempt):
+                        # lxst can appear after startup (package installs, env
+                        # rebuilds); retry without requiring a gateway restart.
+                        self._next_telephone_attempt = time.time() + 600.0
+                        self._start_telephone(self._stack)
+                    logger.debug("Reticulum: re-announced %s%s", self._address_hex,
+                                 " + telephone" if self._telephone is not None else "")
                 except Exception as exc:
                     logger.warning("Reticulum: re-announce failed: %s", exc)
         except asyncio.CancelledError:
@@ -1405,6 +1518,10 @@ class ReticulumAdapter(BasePlatformAdapter):
             body = f"[out of order] {text}" if text else "[out of order: voice message]"
 
         is_voice = bool(media_urls) and any(mime.startswith("audio/") for mime in media_types)
+        # No ``metadata`` here on purpose: native admission only whitelists
+        # WhatsApp's own keys and refuses any other non-empty metadata dict
+        # (gateway/session_envelope.py:_native_metadata). The timing facts live
+        # in raw_message instead, which is not part of the admission check.
         event = MessageEvent(
             text=body,
             message_type=MessageType.VOICE if is_voice else MessageType.TEXT,
@@ -1417,12 +1534,6 @@ class ReticulumAdapter(BasePlatformAdapter):
             media_types=media_types,
             media_filenames=media_names,
             raw_message=meta,
-            metadata={
-                "reticulum_sent_at": timestamp,
-                "reticulum_received_at": received_at,
-                "reticulum_out_of_order": out_of_order,
-                "reticulum_voice": is_voice,
-            },
         )
         logger.debug("Reticulum: message from %s sent %s%s: %.80s",
                      _short(source_hash), _utc_stamp(timestamp),
@@ -1804,6 +1915,9 @@ def _env_enablement() -> Optional[dict]:
         ("RETICULUM_AUDIO_BITRATE", "audio_bitrate", str),
         ("RETICULUM_TTS_MAX_BYTES", "tts_max_bytes", int),
         ("RETICULUM_MAX_AUDIO_BYTES", "max_audio_bytes", int),
+        ("RETICULUM_TELEPHONE", "telephone", _truthy),
+        ("RETICULUM_CALL_MAX_SECONDS", "call_max_seconds", int),
+        ("RETICULUM_CALL_GREETING", "call_greeting", None),
     ), home_env="RETICULUM_HOME_CHANNEL")
     if not seed and not _truthy(platform_gate_env("RETICULUM_ENABLED")):
         return None

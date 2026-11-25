@@ -1,7 +1,7 @@
 name: reticulum-platform
 label: Reticulum (LXMF)
 kind: platform
-version: 2.1.0
+version: 2.2.0
 manifest_version: 2
 description: >
   Reticulum / LXMF gateway adapter for Hermes Agent. Runs an LXMF delivery
@@ -9,8 +9,11 @@ description: >
   clients can message the agent over LoRa, TCP, I2P or any other Reticulum
   transport — no central messaging server. Text and voice: inbound voice
   notes (Ogg/Opus or Codec2) are transcribed by the gateway's STT pipeline,
-  and replies can be spoken back as Ogg/Opus voice notes (TTS). Every message
-  carries a UTC timestamp; out-of-order arrivals are reordered and flagged.
+  and replies can be spoken back as Ogg/Opus voice notes (TTS). Sideband can
+  also place a real LXST telephone call: the adapter announces an
+  ``lxst.telephony`` destination, answers allow-listed callers, records the
+  call and hands the transcript to the agent. Every message carries a UTC
+  timestamp; out-of-order arrivals are reordered and flagged.
   Allow-listed by LXMF destination hash, with optional store-and-forward
   fallback through an LXMF propagation node.
 author: Kyle Williquette
@@ -22,6 +25,7 @@ provides_tools:
 python_dependencies:
   - "rns>=1.6,<2"
   - "lxmf>=1.3,<2"
+  - "lxst>=0.6.1,<0.7"
 # ``requires_env`` and ``optional_env`` entries are surfaced in the
 # ``hermes config`` UI via the platform-plugin env var injector in
 # ``hermes_cli/config.py``.
@@ -109,4 +113,16 @@ optional_env:
   - name: RETICULUM_MAX_AUDIO_BYTES
     description: "Largest inbound voice clip accepted in bytes (default: 4194304)"
     prompt: "Max inbound voice clip bytes (default: 4194304)"
+    password: false
+  - name: RETICULUM_TELEPHONE
+    description: "Announce an LXST telephone destination and answer allow-listed callers (default: true; needs the lxst package)"
+    prompt: "Answer LXST telephone calls? (true/false)"
+    password: false
+  - name: RETICULUM_CALL_MAX_SECONDS
+    description: "Longest recorded telephone call in seconds before the adapter hangs up (default: 300)"
+    prompt: "Max call length in seconds (default: 300)"
+    password: false
+  - name: RETICULUM_CALL_GREETING
+    description: "Optional Ogg/Opus file played when a call is answered (default: generated tone)"
+    prompt: "Call greeting Ogg/Opus path (optional)"
     password: false
