@@ -259,10 +259,10 @@ class TelephoneBridge:
         self._telephone = telephone
         self.address = bytes(telephone.destination.hash).hex()
         self._running = True
-        try:
-            telephone.announce()
-        except Exception as exc:
-            logger.warning("Reticulum: telephone announce failed: %s", exc)
+        # No announce here: RNS interfaces are still negotiating seconds after
+        # startup, and an announce sent now reaches nobody while also tripping
+        # the per-destination announce limiter. The adapter's announce loop
+        # does the first announce after its warm-up and repeats every interval.
         logger.info(
             "Reticulum: telephone ready at %s (LXST, calls from allow-listed peers; "
             "max %ds, recording to %s)",

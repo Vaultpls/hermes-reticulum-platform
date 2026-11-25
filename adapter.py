@@ -1141,8 +1141,10 @@ class ReticulumAdapter(BasePlatformAdapter):
                         # rebuilds); retry without requiring a gateway restart.
                         self._next_telephone_attempt = time.time() + 600.0
                         self._start_telephone(self._stack)
-                    logger.debug("Reticulum: re-announced %s%s", self._address_hex,
-                                 " + telephone" if self._telephone is not None else "")
+                    suffix = ""
+                    if self._telephone is not None:
+                        suffix = " + telephone " + self._telephone.address
+                    logger.info("Reticulum: announced %s%s", self._address_hex, suffix)
                 except Exception as exc:
                     logger.warning("Reticulum: re-announce failed: %s", exc)
         except asyncio.CancelledError:
