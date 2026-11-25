@@ -239,6 +239,8 @@ class TelephoneBridge:
             return False
 
         self._telephony_module = telephony
+        if not self.greeting_path:
+            self.greeting_path = self._speech_greeting()
         try:
             self._install_headless_audio()
             telephone = telephony.Telephone(
@@ -343,6 +345,43 @@ class TelephoneBridge:
         return ToneSource(frequency=440, gain=0.0, ease=False,
                           target_frame_ms=frame_ms, codec=codec, sink=sink)
 
+    def _speech_greeting(self) -> Optional[str]:
+        """Render a short spoken greeting with edge-tts, cached on disk.
+
+        Lets a caller hear a voice on pickup without depending on the
+        gateway's TTS backend. Falls back to the generated tone when
+        edge-tts or the network is unavailable.
+        """
+        path = os.path.join(self._calls_dir(), "greeting-speech.mp3")
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+        exe = None
+        import sys as _sys
+        candidate = os.path.join(os.path.dirname(_sys.executable), "edge-tts")
+        if os.path.isfile(candidate):
+            exe = candidate
+        else:
+            exe = shutil.which("edge-tts")
+        if not exe:
+            return None
+        text = os.environ.get("RETICULUM_CALL_GREETING_TEXT",
+                              "Hermes here. Go ahead.").strip()
+        voice = os.environ.get("RETICULUM_CALL_GREETING_VOICE",
+                               "en-US-AriaNeural").strip()
+        try:
+            os.makedirs(self._calls_dir(), exist_ok=True)
+            result = subprocess.run(
+                [exe, "--text", text, "--voice", voice, "--write-media", path],
+                capture_output=True, timeout=30, stdin=subprocess.DEVNULL, check=False)
+            if result.returncode == 0 and os.path.getsize(path) > 0:
+                logger.info("Reticulum: call greeting spoken by %s: %r", voice, text)
+                return path
+            logger.warning("Reticulum: could not synthesize the call greeting: %s",
+                           (result.stderr or b"").decode("utf-8", "replace")[:200])
+        except Exception as exc:
+            logger.warning("Reticulum: could not synthesize the call greeting: %s", exc)
+        return None
+
     def _greeting_for(self, frame_ms: int) -> Optional[str]:
         """Greeting Ogg/Opus with frames of exactly ``frame_ms``.
 
@@ -363,7 +402,8 @@ class TelephoneBridge:
                 source = candidate
             else:
                 logger.warning("Reticulum: call greeting %s not found", candidate)
-        cached = os.path.join(self._calls_dir(), f"greeting-{frame_ms}ms.ogg")
+        stem = "greeting-speech" if source else "greeting"
+        cached = os.path.join(self._calls_dir(), f"{stem}-{frame_ms}ms.ogg")
         if os.path.isfile(cached):
             return cached
         try:
