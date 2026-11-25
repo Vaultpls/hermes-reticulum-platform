@@ -1143,7 +1143,7 @@ class ReticulumAdapter(BasePlatformAdapter):
                         self._start_telephone(self._stack)
                     suffix = ""
                     if self._telephone is not None:
-                        suffix = " + telephone " + self._telephone.address
+                        suffix = f" + telephone {self._telephone.address or '?'}"
                     logger.info("Reticulum: announced %s%s", self._address_hex, suffix)
                 except Exception as exc:
                     logger.warning("Reticulum: re-announce failed: %s", exc)
