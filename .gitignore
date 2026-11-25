@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Reticulum / LXMF state
+hermes_identity
+hermes_identity.corrupt-*
+storage/
+.lxmf/
+.reticulum/
+
+# Self-test artifacts
+hermes-reticulum-selftest-*/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

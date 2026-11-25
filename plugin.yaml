@@ -1,0 +1,89 @@
+name: reticulum-platform
+label: Reticulum (LXMF)
+kind: platform
+version: 2.0.0
+manifest_version: 2
+description: >
+  Reticulum / LXMF gateway adapter for Hermes Agent. Runs an LXMF delivery
+  endpoint on a Reticulum mesh so Sideband, Nomad Network and other LXMF
+  clients can message the agent over LoRa, TCP, I2P or any other Reticulum
+  transport — no central messaging server. Text-only, allow-listed by LXMF
+  destination hash, with optional store-and-forward fallback through an
+  LXMF propagation node.
+author: Kyle Williquette
+license: MIT
+homepage: https://github.com/Vaultpls/hermes-reticulum-platform
+provides_tools:
+  - reticulum_stamp_cost
+  - reticulum_display_name
+python_dependencies:
+  - "rns>=1.6,<2"
+  - "lxmf>=1.3,<2"
+# ``requires_env`` and ``optional_env`` entries are surfaced in the
+# ``hermes config`` UI via the platform-plugin env var injector in
+# ``hermes_cli/config.py``.
+optional_env:
+  - name: RETICULUM_DISPLAY_NAME
+    description: "Name announced on the mesh (default: Hermes)"
+    prompt: "Display name (default: Hermes)"
+    password: false
+  - name: RETICULUM_STORAGE
+    description: "Directory for the LXMF identity and router state (default: ~/.lxmf/storage)"
+    prompt: "LXMF storage directory (default: ~/.lxmf/storage)"
+    password: false
+  - name: RETICULUM_CONFIG
+    description: "Reticulum config directory (default: ~/.reticulum or /etc/reticulum)"
+    prompt: "Reticulum config directory (optional)"
+    password: false
+  - name: RETICULUM_ALLOWED_USERS
+    description: "Comma-separated LXMF destination hashes allowed to talk to the bot (blank = deny all)"
+    prompt: "Allowed LXMF hashes (comma-separated)"
+    password: false
+  - name: RETICULUM_ALLOW_ALL_USERS
+    description: "Allow any destination hash to talk to the bot (dev only — disables the allowlist)"
+    prompt: "Allow all destinations? (true/false)"
+    password: false
+  - name: RETICULUM_STAMP_COST
+    description: "Proof-of-work stamp cost required from senders (default: 8; 0 disables)"
+    prompt: "Inbound stamp cost (default: 8; 0 = off)"
+    password: false
+  - name: RETICULUM_ANNOUNCE_INTERVAL
+    description: "Seconds between delivery announces (default: 900, minimum: 300)"
+    prompt: "Re-announce interval in seconds (default: 900)"
+    password: false
+  - name: RETICULUM_PROPAGATION_NODE
+    description: "LXMF propagation node hash for store-and-forward replies (optional; auto-selected from announces when blank)"
+    prompt: "Outbound propagation node hash (optional)"
+    password: false
+  - name: RETICULUM_PROPAGATION_SYNC_INTERVAL
+    description: "Seconds between LXMF propagation-node sync pulls (0 disables; default 60)"
+    prompt: "Propagation sync interval in seconds (default 60)"
+    password: false
+  - name: RETICULUM_PROPAGATED_FALLBACK
+    description: "Retry failed DIRECT sends through a propagation node (default: true)"
+    prompt: "Propagation fallback? (true/false)"
+    password: false
+  - name: RETICULUM_DELIVERY_TIMEOUT
+    description: "Seconds to wait for a DIRECT delivery proof (default: 150)"
+    prompt: "DIRECT delivery timeout in seconds (default: 150)"
+    password: false
+  - name: RETICULUM_PROPAGATED_TIMEOUT
+    description: "Seconds to wait for propagation-node acceptance (default: 180)"
+    prompt: "Propagated send timeout in seconds (default: 180)"
+    password: false
+  - name: RETICULUM_DENY_REPLY
+    description: "Reply 'Access not authorized' to non-allow-listed senders (default: false)"
+    prompt: "Reply to denied senders? (true/false)"
+    password: false
+  - name: RETICULUM_HOME_CHANNEL
+    description: "Default LXMF hash for cron / notification delivery"
+    prompt: "Home channel LXMF hash (or empty)"
+    password: false
+  - name: RETICULUM_HOME_CHANNEL_NAME
+    description: "Human label for the home channel (defaults to the hash)"
+    prompt: "Home channel display name (or empty)"
+    password: false
+  - name: HERMES_RETICULUM_TEXT_BATCH_DELAY
+    description: "Quiet-period seconds (default: 1.5) used to merge rapid inbound messages into one turn"
+    prompt: "Text batch flush delay in seconds (default: 1.5)"
+    password: false
